@@ -282,6 +282,38 @@ def test_download_bad_scheme_allowed_in_absolute(absolute_access):
     assert "only http(s)" not in res
 
 
+def test_absolute_download_honors_explicit_file_destination(tmp_path, absolute_access):
+    from titan_agent.tools import ToolRegistry
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"verified-download")
+    workspace = tmp_path / "workspace"
+    target = workspace / "named-output.bin"
+    registry = ToolRegistry(workspace)
+
+    result = asyncio.run(registry.tool_download_file(source.as_uri(), dest=str(target)))
+
+    assert "Downloaded" in result
+    assert target.read_bytes() == b"verified-download"
+    assert not list(workspace.glob(".titan-download-*"))
+
+
+def test_oversized_absolute_download_is_stream_limited_and_atomic(tmp_path, absolute_access, monkeypatch):
+    import titan_agent.tools as tools
+
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"x" * 32)
+    monkeypatch.setattr(tools, "FULL_ACCESS_MAX_DOWNLOAD_BYTES", 8)
+    workspace = tmp_path / "workspace"
+    registry = tools.ToolRegistry(workspace)
+
+    result = asyncio.run(registry.tool_download_file(source.as_uri()))
+
+    assert "exceeds the configured 8-byte safety limit" in result
+    assert not (workspace / "payload.bin").exists()
+    assert not list(workspace.glob(".titan-download-*"))
+
+
 def test_http_server_port_range_widened_in_full(full_access):
     from titan_agent.tools import ToolRegistry
 

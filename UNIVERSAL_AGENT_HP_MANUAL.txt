@@ -66,7 +66,7 @@ Requirements:
   • Python 3.11 or Python 3.12+
   • Git installed and in PATH
   • Optional: Docker (for air-gapped Docker sandboxing)
-  • Optional: Local LLM runner (Laya MLX on Apple Silicon / Ollama on PC/Mac/Linux)
+  • Optional: Local generative LLM runner (Ollama/LM Studio); Laya is a typed-decision model, not a chat LLM.
 
 Configuration (.env):
   Copy `.env.example` to `.env` in the project root:
@@ -77,7 +77,7 @@ Key Parameters:
   • ANTHROPIC_API_KEY   : Anthropic API key (claude-3-5-sonnet, claude-3-5-haiku)
   • GEMINI_API_KEY      : Google Gemini API key (gemini-1.5-pro, gemini-1.5-flash)
   • DEEPSEEK_API_KEY    : DeepSeek API key (deepseek-coder, deepseek-reasoner)
-  • LAYA_MLX_URL        : http://127.0.0.1:8080 (for local Mac / PC MLX runner)
+  • Laya checkpoint weights are downloaded and cached by the optional Laya decision runtime; no API key is used.
   • OLLAMA_HOST         : http://127.0.0.1:11434 (for local Ollama runner)
   • TELEGRAM_BOT_TOKEN  : Telegram bot token (if running in Telegram mode)
   • SERVER_PORT         : Default is 8000
@@ -91,9 +91,11 @@ FREE BUILT-IN & LOCAL MODELS (NO API KEYS NEEDED):
   2. Completions.me:
      Free OpenAI-compatible gateway (Claude Opus, GPT-5 class, Gemini Pro).
      Usage: python cli.py --provider completions --model claude-sonnet-4.5
-  3. Laya MLX (Local Mac / PC):
-     Hardware-accelerated local model inference on localhost:8080.
-     Usage: python cli.py --provider laya-mlx --model local
+  3. Laya / Laya-MLX (API-key-free typed decisions):
+     Local choice, score, and yes/no probability inference; it does not generate chat or code.
+     Install `pip install -e '.[laya]'` on supported systems, or `pip install -e '.[laya-mlx]'`
+     on Apple Silicon macOS. Weights download on first use. Example:
+     python -m titan_agent.laya_decisions --state "I was charged twice" --questions examples/laya-questions.json
   4. Ollama (Offline Local Models):
      Run DeepSeek-R1, Llama 3.2, Qwen 2.5, Mistral privately on localhost:11434.
      Usage: python cli.py --provider ollama --model deepseek-r1:8b
@@ -373,12 +375,11 @@ Q1: Web UI does not start or port 8000 is occupied.
 A1: Launch on another port:
     python run.py --port 8085
 
-Q2: How do I run Titan completely locally without external API keys?
-A2: Install and start Laya MLX or Ollama. Set in your `.env`:
-    LAYA_MLX_URL=http://127.0.0.1:8080
-    OLLAMA_HOST=http://127.0.0.1:11434
-    Then run:
-    python cli.py --provider laya_mlx --model local
+Q2: How do I run Titan locally without external API keys?
+A2: For full chat and code generation, install/start a local generative model with Ollama or LM Studio.
+    Laya and Laya-MLX provide local typed decisions (choice/score/yes-no), not chat generation.
+    Install `pip install -e '.[laya]'` or, on Apple Silicon macOS, `pip install -e '.[laya-mlx]'`.
+    Then call `laya_decide` or run `python -m titan_agent.laya_decisions` with a question JSON file.
 
 Q3: A command modified files incorrectly. How do I revert?
 A3: If you captured a snapshot:

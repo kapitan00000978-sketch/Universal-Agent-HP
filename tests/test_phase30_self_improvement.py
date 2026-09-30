@@ -21,13 +21,30 @@ def temp_workspace():
 
 
 class TestEvalSuite:
-    def test_run_core_benchmark_default(self):
+    def test_default_suite_does_not_fabricate_success_without_runner(self):
         suite = EvalSuite()
         res = suite.run_suite()
         assert res["total_cases"] >= 4
-        assert res["passed"] == res["total_cases"]
-        assert res["pass_rate"] == 100.0
-        assert res["average_score"] == 1.0
+        assert res["attempted"] == 0
+        assert res["not_run"] == res["total_cases"]
+        assert res["passed"] == 0
+        assert res["failed"] == 0
+        assert res["pass_rate"] is None
+        assert res["average_score"] is None
+        assert all(result["status"] == "not_run" for result in res["results"])
+
+    def test_live_runner_results_are_counted_as_executed(self):
+        case = EvalCase(
+            id="actual-run",
+            description="Runner output must satisfy the rubric",
+            expected_keywords=["checked", "passed"],
+        )
+        result = EvalSuite([case]).run_suite(runner_fn=lambda _prompt: "Checked and passed.")
+        assert result["attempted"] == 1
+        assert result["not_run"] == 0
+        assert result["passed"] == 1
+        assert result["pass_rate"] == 100.0
+        assert result["results"][0]["status"] == "completed"
 
     def test_eval_case_with_custom_runner_and_failure(self):
         suite = EvalSuite([
@@ -140,12 +157,13 @@ class TestToolRegistrySelfImprovementIntegration:
         assert "task_demo_err" in res
         assert "Extracted Rule" in res
 
-    def test_tool_self_improve_eval_run(self, temp_workspace: Path):
+    def test_tool_self_improve_eval_run_reports_not_run_without_evaluator(self, temp_workspace: Path):
         tools = ToolRegistry(temp_workspace)
         res = tools.tool_self_improve_eval_run()
-        assert "EVAL BENCHMARK RESULTS" in res
-        assert "Pass Rate" in res
-        assert "100.0%" in res
+        assert "NOT RUN" in res
+        assert "no live evaluation runner is configured" in res
+        assert "100.0%" not in res
+        assert "Average Quality Score" not in res
 
     def test_tool_self_improve_crystallize_lesson(self, temp_workspace: Path):
         tools = ToolRegistry(temp_workspace)

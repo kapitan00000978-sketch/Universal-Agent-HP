@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,7 @@ from .skills import SkillRegistry
 from .telegram import TelegramError, TelegramManager
 from .tool_stats import TOOL_STATS, ToolStatsCollector
 from .tools import ToolRegistry
+from .run_trace import RunTraceStore, bind_run_id, current_run_id, reset_run_id
 
 log = logging.getLogger(__name__)
 
@@ -77,14 +79,17 @@ TITAN_SYSTEM_PROMPT = """You are TITAN AGENT — an ultra-powerful autonomous AI
 3. VERIFY results: After every tool result, check for errors. If a command fails, read the stderr, fix your arguments or approach, and retry with an alternative method — never give up on the first error.
 4. REFLECT before reporting: You will get a chance to critically review your own work (critic phase) before the final answer — use it to catch missed requirements, unverified claims and errors.
 5. REPORT clearly: End with a complete, well-structured final answer in markdown, in the user's language. Only claim something is done if you have actually verified it via tools.
+6. UNDERSTAND before editing existing code: map the Python repository, inspect the relevant source and tests, trace callers when practical, then make the smallest compatible change and run focused verification. Static analysis is evidence, not proof of runtime behavior.
 
 ### TOOL CATALOG (use these; the full live catalog is appended to your context):
-- execute_command — run PowerShell/terminal commands (real OS execution)
+- execute_command — run shell commands in the Docker sandbox by default; only explicit TITAN_FULL_ACCESS runs them on the host
 - read_file / write_file / edit_file / list_directory — filesystem operations inside the workspace
+- analyze_python_file / analyze_python_repository — AST-based explanation of Python files, module structure, and local import dependencies; safe to use on unfamiliar code because they never execute project source
+- laya_decide — optional API-key-free local choice/score/yes-no inference; it does not generate chat responses or code
 - workspace_rag — local BM25 retrieval: finds the most relevant snippets (with file paths) across ALL workspace files for any question
 - web_search — live DuckDuckGo internet search
 - scrape_webpage — fetch readable text from a URL
-- python_eval — run Python in an isolated subprocess
+- python_eval — run Python through the same network-disabled Docker sandbox
 - deep_search — multi-hop, multi-source research dossier on a topic
 - deep_coder — full software engineering cycle: write files, syntax-check, run tests
 - launch_application — open Windows desktop apps
@@ -116,7 +121,7 @@ TITAN_SYSTEM_PROMPT = """You are TITAN AGENT — an ultra-powerful autonomous AI
 - debate_solve — MULTI-AGENT DEBATE (Genesis Level 4): Advocate vs Skeptic vs Judge consensus arbitration.
 - reflexion_solve — ITERATIVE REFLEXION (Genesis Level 4): 3-cycle autonomous self-critique and refinement.
 - kg_query / kg_impact_analysis / kg_index_workspace — KNOWLEDGE GRAPH (Genesis Level 3): semantic dependency tracking and code modification blast-radius analysis.
-- synthesize_tool — ON-THE-FLY TOOL SYNTHESIS: dynamically creates, tests in an isolated sandbox, compiles, and registers a brand new Python tool when existing tools cannot solve the problem.
+- synthesize_tool — OPTIONAL ON-THE-FLY TOOL SYNTHESIS (disabled unless TITAN_DYNAMIC_TOOLS_ENABLED=true): Docker is required for both verification and every generated-tool invocation; verification is not proof of safety.
 - symbolic_check_code — SYMBOLIC AST INVARIANT CHECKER: verifies code safety, infinite loops, shell injections, and resource leaks before runtime execution.
 - skill_save — AUTONOMOUS SKILLS: synthesize and save a reusable workflow playbook directly to the skills library.
 - tdd_cycle — AUTONOMOUS TDD ENGINE: executes rigorous Red-Green-Refactor software cycles in an isolated sandbox (proves test fails first, writes code, passes symbolic invariants).
@@ -558,6 +563,32 @@ class AgentEvent:
     def to_dict(self):
         return {"type": self.type, "data": self.data}
 
+class _TraceAwareLLMClient:
+    """Transparent LLM proxy that captures safe call metadata for structured paths."""
+
+    def __init__(self, agent: "TitanAgent", client: Any, call_role: str):
+        self._agent = agent
+        self._client = client
+        self._call_role = call_role
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self._agent._traced_chat_completion(
+            self._client,
+            messages,
+            tools=tools,
+            call_role=self._call_role,
+            **kwargs,
+        )
+
+
 class TitanAgent:
     def __init__(
         self,
@@ -580,6 +611,8 @@ class TitanAgent:
         tool_stats: ToolStatsCollector | None = None,
         domain: str | None = None,
         domain_manager: Any | None = None,
+        trace_store: RunTraceStore | None = None,
+        trace_path: Path | str | None = None,
     ):
         self.llm = llm or LLMClient()
         # Phase 21: dedicated reviewer for the critic/reflection pass. When
@@ -627,6 +660,9 @@ class TitanAgent:
         if hasattr(self.tools, "_domain_manager_ref"):
             self.tools._domain_manager_ref = self.domain_manager
         self.mcp = mcp or MCPManager()
+        attach_mcp = getattr(self.tools, "attach_mcp_manager", None)
+        if callable(attach_mcp):
+            attach_mcp(self.mcp)
         self.memory = memory or MemoryManager()
         self.skills = skills or SkillRegistry()
         self.telegram = telegram or TelegramManager()
@@ -659,6 +695,15 @@ class TitanAgent:
         self._checkpoint = checkpoint
         self._checkpoint_loaded = checkpoint is not None
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else (WORKSPACE_DIR / "checkpoints.db")
+        # Structured traces persist operational metadata only (never prompts,
+        # tool arguments/results, or exception text).
+        self._trace_store = trace_store
+        self._trace_store_loaded = trace_store is not None
+        self.trace_path = (
+            Path(trace_path)
+            if trace_path is not None
+            else self.checkpoint_path.with_name("agent_traces.db")
+        )
 
     @property
     def core_memory(self) -> MemorySystem | None:
@@ -1128,9 +1173,76 @@ class TitanAgent:
                     log.warning("core memory write failed: %s", exc)
         if auto_commit and final_text:
             try:
+                approval = await self._approval_gate(
+                    "git_commit",
+                    {"message": f"agent: {user_input[:60]}", "automatic": True},
+                )
+                if approval is False or (approval is None and not full_access_enabled()):
+                    log.warning("automatic commit skipped: human approval was unavailable or denied")
+                    return
                 await asyncio.to_thread(git_auto_commit, self.git_root, user_input)
             except Exception as exc:  # noqa: BLE001 - commit must never kill the run
                 log.warning("auto-commit failed: %s", exc)
+
+    @property
+    def trace_store(self) -> RunTraceStore | None:
+        """Lazily open the local privacy-minimizing run trace database."""
+        if self._trace_store_loaded:
+            return self._trace_store
+        self._trace_store_loaded = True
+        try:
+            self._trace_store = RunTraceStore(self.trace_path)
+        except Exception as exc:  # noqa: BLE001 - tracing must not break agent work
+            log.warning("run trace store unavailable: %s", exc)
+            self._trace_store = None
+        return self._trace_store
+
+    def _record_trace_event(
+        self,
+        event_type: str,
+        *,
+        component: str = "agent",
+        status: str | None = None,
+        duration_ms: float | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Best-effort trace write; a telemetry failure never blocks the run."""
+        if current_run_id() is None:
+            return
+        try:
+            store = self.trace_store
+            if store is not None:
+                store.record(
+                    event_type,
+                    component=component,
+                    status=status,
+                    duration_ms=duration_ms,
+                    details=details,
+                )
+        except Exception as exc:  # noqa: BLE001 - trace must remain non-fatal
+            log.debug("run trace write failed for %s: %s", event_type, exc)
+
+    @staticmethod
+    def _pending_tool_names(messages: list[dict[str, Any]]) -> list[str]:
+        """Names of tool calls that have no persisted tool response yet."""
+        completed_ids = {
+            str(message.get("tool_call_id"))
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "tool"
+        }
+        pending: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id", ""))
+                function = call.get("function") or {}
+                name = str(function.get("name") or "unknown tool")
+                if call_id not in completed_ids:
+                    pending.append(name)
+        return list(dict.fromkeys(pending))
 
     def _checkpoint_load(self, session_id: str) -> RunCheckpoint | None:
         """Best-effort load of a session's checkpoint; never raises."""
@@ -1156,11 +1268,11 @@ class TitanAgent:
         tools_used: list[str] | None = None,
         status: str = "running",
         final_answer: str | None = None,
-    ) -> None:
-        """Best-effort persist of the run's live state (always-on checkpointing)."""
+    ) -> bool:
+        """Persist the live state; return whether SQLite confirmed the checkpoint."""
         store = self.checkpoint_store
         if store is None:
-            return
+            return False
         try:
             trimmed = list(messages)[-CHECKPOINT_MAX_MESSAGES:]
             store.save(
@@ -1177,29 +1289,90 @@ class TitanAgent:
                     final_answer=final_answer,
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - checkpointing must never break a run
-            log.debug("checkpoint save failed for %s: %s", session_id, exc)
+            return True
+        except Exception as exc:  # noqa: BLE001 - checkpointing failure blocks tool execution
+            log.warning("checkpoint save failed for %s: %s", session_id, exc)
+            return False
 
     async def _approval_gate(self, name: str, args: dict[str, Any]) -> bool | None:
         """Phase 14: single HITL approval decision point for sensitive tools.
 
         Returns:
-          None  -> no approval needed (or gate disabled / under FULL access)
+          None  -> no approval is required (or FULL access explicitly bypasses it)
           True  -> explicitly APPROVED by the human
-          False -> denied or timed out (caller must not execute)
+          False -> denied, unavailable, timed out, or errored (caller must not execute)
         """
         try:
             if full_access_enabled():
-                return None  # Phase 8: approvals are auto-granted in FULL access
-            resource = str(args.get("command", "")) if name == "execute_command" else name
+                return None  # Explicit FULL_ACCESS bypass is intentionally preserved.
+            is_shell_tool = name in {"execute_command", "tool_execute_command", "self_heal"}
+            policy_action = "execute_command" if is_shell_tool else name
+            resource = str(args.get("command", "")) if is_shell_tool else name
             decision = PolicyEngine().check(
-                name,
+                policy_action,
                 resource,
                 json.dumps(args, default=str),
                 access=PolicyEngine.ACCESS_NORMAL,
             )
-            if decision.decision != Decision.REQUIRE_APPROVAL:
+            if decision.decision == Decision.DENY:
+                self._record_trace_event(
+                    "approval_result",
+                    component="approval",
+                    status="blocked",
+                    details={"tool_name": name, "decision": "policy_deny"},
+                )
+                return False
+
+            # External integrations and high-impact controls require a live
+            # human decision unless the operator explicitly enabled FULL_ACCESS.
+            # MCP tool annotations are hints only; arbitrary servers are not
+            # trusted to self-certify that a call is harmless.
+            approval_required_tools = {
+                "telegram_send", "telegram_login_start", "telegram_login_confirm", "telegram_logout",
+                "download_file", "tool_download_file",
+                "git_commit", "git_create_branch", "git_create_pr",
+                "screenshot", "take_screenshot",
+                "self_update", "synthesize_tool", "tool_synthesize_tool",
+                "browser_click", "browser_type", "key_press", "mouse_click",
+                "clipboard_set", "window_control", "launch_application",
+                "start_http_server", "stop_http_server", "blender_execute_script",
+            }
+            tool_registry = getattr(self.tools, "delegate", self.tools)
+            synthesized_names = set(getattr(tool_registry, "_synthesized_definitions", {}))
+            requires_explicit_approval = (
+                decision.decision == Decision.REQUIRE_APPROVAL
+                or name.startswith("mcp_")
+                or name in approval_required_tools
+                or name in synthesized_names
+                or (
+                    name in {"docker_sandbox_run", "tool_docker_sandbox_run"}
+                    and (
+                        str(args.get("network", "none")).lower() == "bridge"
+                        or bool(args.get("mount_workspace"))
+                    )
+                )
+                or (
+                    name == "manage_processes"
+                    and str(args.get("action", "list")).lower() not in {"list", "status"}
+                )
+            )
+            if not requires_explicit_approval:
                 return None
+            self._record_trace_event(
+                "approval_requested",
+                component="approval",
+                status="pending",
+                details={"tool_name": name},
+            )
+            if self.hitl is None:
+                log.warning("approval required for %s but no HITL manager is configured", name)
+                self._record_trace_event(
+                    "approval_result",
+                    component="approval",
+                    status="denied",
+                    details={"tool_name": name, "decision": "unavailable"},
+                )
+                return False
             req = self.hitl.request(
                 name,
                 resource,
@@ -1207,10 +1380,23 @@ class TitanAgent:
                 reason="; ".join(decision.reasons or []) or "requires human approval",
             )
             req = await self.hitl.wait(req, timeout=self.hitl_timeout)
-            return req.status == ApprovalStatus.APPROVED
-        except Exception as exc:  # noqa: BLE001 - the gate must never break a run
-            log.debug("approval gate failed for %s: %s", name, exc)
-            return None
+            approved = req.status == ApprovalStatus.APPROVED
+            self._record_trace_event(
+                "approval_result",
+                component="approval",
+                status="approved" if approved else "denied",
+                details={"tool_name": name, "decision": req.status.value},
+            )
+            return approved
+        except Exception as exc:  # noqa: BLE001 - errors must never authorize a sensitive action
+            self._record_trace_event(
+                "approval_result",
+                component="approval",
+                status="failed_closed",
+                details={"tool_name": name, "decision": "error", "error_type": type(exc).__name__},
+            )
+            log.warning("approval gate failed closed for %s: %s", name, exc)
+            return False
 
     def _written_paths(self, messages: list[dict[str, Any]]) -> list[str]:
         """Deduplicated file paths written/edited this run, extracted from the
@@ -1383,9 +1569,22 @@ class TitanAgent:
                     "prerequisites first."
                 )
         start = time.monotonic()
+        self._record_trace_event(
+            "tool_started",
+            component="tool",
+            status="started",
+            details={"tool_name": name},
+        )
         try:
             result = await self._execute_tool_unified(name, args)
         except Exception as exc:
+            self._record_trace_event(
+                "tool_failed",
+                component="tool",
+                status="failed",
+                duration_ms=(time.monotonic() - start) * 1000,
+                details={"tool_name": name, "error_type": type(exc).__name__},
+            )
             self.tool_stats.record(
                 name,
                 ok=False,
@@ -1397,6 +1596,13 @@ class TitanAgent:
                 self._guard_failures[gkey] = prior + 1
             raise
         ok = not (isinstance(result, str) and result.startswith("Error"))
+        self._record_trace_event(
+            "tool_finished" if ok else "tool_failed",
+            component="tool",
+            status="success" if ok else "failed",
+            duration_ms=(time.monotonic() - start) * 1000,
+            details={"tool_name": name},
+        )
         self.tool_stats.record(
             name,
             ok=ok,
@@ -1428,14 +1634,13 @@ class TitanAgent:
         # Phase 14: Human-in-the-loop approval gate. Executes for every tool
         # call funnel (classic loop, structured strategy, cron, queue) so the
         # live agent truly waits for a human instead of silently doing nothing.
-        # When no HITL is wired (tests / headless) today's behavior is kept.
-        if self.hitl is not None:
-            granted = await self._approval_gate(name, args)
-            if granted is False:
-                return (
-                    "Error: approval required but not granted "
-                    f"(tool='{name}' was not approved by the human)."
-                )
+        # Sensitive actions fail closed if no HITL manager exists or the gate errors.
+        granted = await self._approval_gate(name, args)
+        if granted is False:
+            return (
+                "Error: approval required or action blocked by policy; not executed "
+                f"(tool='{name}' was not executed)."
+            )
         # Dual-Shield Cyber Defense Sentinel Check
         if name in ("execute_command", "tool_execute_command", "docker_sandbox_run", "tool_docker_sandbox_run"):
             cmd = str(args.get("command") or args.get("cmd") or "")
@@ -1621,7 +1826,9 @@ class TitanAgent:
         self,
         response,
         messages: list[dict[str, Any]],
-        iteration: int
+        iteration: int,
+        *,
+        checkpoint_context: dict[str, Any] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """Executes all tool_calls inside `response` IN PARALLEL and streams
         events. Mutates `messages` in place.
@@ -1664,10 +1871,26 @@ class TitanAgent:
             )
 
         # Execute all runnable tools concurrently inside a parallelism cap
-        # (Phase 17). Every tool call is FULLY isolated: a crashing tool
-        # returns its error as an ordinary tool result and never aborts its
-        # siblings or the run. With TITAN_CANCEL_ON_TOOL_ERROR=1 the batch
+        # (Phase 17). Each tool's Python exception is isolated from siblings;
+        # this is not OS/process security isolation. With TITAN_CANCEL_ON_TOOL_ERROR=1 the batch
         # stops as soon as any tool fails and in-flight siblings are cancelled.
+        checkpoint_failed = False
+        if runnable and checkpoint_context is not None:
+            intent_checkpoint = {
+                **checkpoint_context,
+                "messages": messages,
+                "steps_done": iteration,
+                "tools_used": [name for _call, name, _args in runnable],
+                "status": "tool_in_progress",
+            }
+            checkpoint_failed = not self._checkpoint_save(**intent_checkpoint)
+            if checkpoint_failed:
+                yield AgentEvent(
+                    "error",
+                    "Tool calls were not executed because the pre-action checkpoint could not be saved. "
+                    "Restore checkpoint storage before retrying.",
+                )
+
         limit = parallel_tool_calls()
         cancel_on_fail = cancel_on_tool_error()
         semaphore = asyncio.Semaphore(max(1, limit))
@@ -1714,7 +1937,10 @@ class TitanAgent:
             async with semaphore:
                 return await _run_one(*p)
 
-        pending = {asyncio.ensure_future(_limited(p)): p for p in runnable}
+        pending = (
+            {asyncio.ensure_future(_limited(p)): p for p in runnable}
+            if not checkpoint_failed else {}
+        )
         finished: dict[asyncio.Future, tuple] = {}
         cancelled_calls: list[tuple] = []
         failed_tool: str | None = None
@@ -1747,6 +1973,13 @@ class TitanAgent:
             id(tool_call): result
             for _status, tool_call, _name, result in finished.values()
         }
+        if checkpoint_failed:
+            result_map.update({
+                id(tool_call): (
+                    "Error: not executed because the durable pre-action checkpoint failed."
+                )
+                for tool_call, _name, _args in runnable
+            })
         if cancelled_calls:
             result_map.update({
                 id(tool_call): (
@@ -1815,6 +2048,45 @@ class TitanAgent:
                 "content": str(result)
             })
 
+    async def _traced_chat_completion(
+        self,
+        client: Any,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        call_role: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Call an LLM and trace only provider/model, role, outcome, and latency."""
+        started = time.monotonic()
+        details = {
+            "call_role": call_role,
+            "provider": getattr(client, "provider", None),
+            "model": getattr(client, "model", None),
+        }
+        self._record_trace_event(
+            "model_call_started", component="llm", status="started", details=details
+        )
+        try:
+            response = await client.chat_completion(messages, tools=tools, **kwargs)
+        except BaseException as exc:
+            self._record_trace_event(
+                "model_call_failed",
+                component="llm",
+                status="failed",
+                duration_ms=(time.monotonic() - started) * 1000,
+                details={**details, "error_type": type(exc).__name__},
+            )
+            raise
+        self._record_trace_event(
+            "model_call_finished",
+            component="llm",
+            status="success",
+            duration_ms=(time.monotonic() - started) * 1000,
+            details=details,
+        )
+        return response
+
     async def _summarize_context(self, dropped: list[dict[str, Any]]) -> str | None:
         """Phase 18: condense dropped messages into a short background summary.
 
@@ -1833,8 +2105,11 @@ class TitanAgent:
                 "in at most 700 characters of plain text. Do not introduce new "
                 "information.\n\n" + text
             )
-            resp = await self.llm.chat_completion(
-                [{"role": "user", "content": prompt}], tools=[]
+            resp = await self._traced_chat_completion(
+                self.llm,
+                [{"role": "user", "content": prompt}],
+                tools=[],
+                call_role="context_summary",
             )
             content = (resp.content or "").strip() if resp else ""
             return content or None
@@ -1925,7 +2200,9 @@ class TitanAgent:
 
         for attempt in range(LLM_TRANSIENT_RETRIES + 1):
             try:
-                response = await self.llm.chat_completion(working, tools=tools)
+                response = await self._traced_chat_completion(
+                    self.llm, working, tools=tools, call_role="agent_turn"
+                )
                 return response, working, notes
             except transient as e:
                 if attempt >= LLM_TRANSIENT_RETRIES:
@@ -1975,7 +2252,94 @@ class TitanAgent:
         strategy: str = "auto",
         auto_commit: bool | None = None,
         resume: bool = False,
-        system_extra: str | None = None
+        system_extra: str | None = None,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Run a task while journaling privacy-safe lifecycle and tool metadata."""
+        run_id = uuid.uuid4().hex
+        started = time.monotonic()
+        token = bind_run_id(run_id)
+        saw_final = False
+        saw_error = False
+        terminal_exception = False
+        self._record_trace_event(
+            "run_started",
+            component="run",
+            status="running",
+            details={
+                "mode": mode if mode in {"fast", "deep", "deep_search"} else "unknown",
+                "effort": effort if effort in {"auto", "low", "medium", "high", "ultra"} else "unknown",
+                "strategy": strategy if strategy in {"auto", "plan", "react", "tot"} else "unknown",
+                "provider": getattr(self.llm, "provider", None),
+                "model": getattr(self.llm, "model", None),
+            },
+        )
+        try:
+            async for event in self._run_task_impl(
+                user_input,
+                session_id=session_id,
+                mode=mode,
+                effort=effort,
+                strategy=strategy,
+                auto_commit=auto_commit,
+                resume=resume,
+                system_extra=system_extra,
+            ):
+                if event.type == "final_answer":
+                    saw_final = True
+                elif event.type == "error":
+                    saw_error = True
+                yield event
+        except asyncio.CancelledError:
+            terminal_exception = True
+            self._record_trace_event("run_cancelled", component="run", status="cancelled")
+            raise
+        except GeneratorExit:
+            terminal_exception = True
+            self._record_trace_event("run_interrupted", component="run", status="interrupted")
+            raise
+        except BaseException as exc:
+            terminal_exception = True
+            self._record_trace_event(
+                "run_failed",
+                component="run",
+                status="failed",
+                details={"error_type": type(exc).__name__},
+            )
+            raise
+        finally:
+            if not terminal_exception and saw_final:
+                self._record_trace_event(
+                    "run_finished",
+                    component="run",
+                    status="finished_with_errors" if saw_error else "finished",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+            elif not terminal_exception and not saw_error:
+                self._record_trace_event(
+                    "run_interrupted",
+                    component="run",
+                    status="interrupted",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+            elif not terminal_exception:
+                self._record_trace_event(
+                    "run_failed",
+                    component="run",
+                    status="failed",
+                    duration_ms=(time.monotonic() - started) * 1000,
+                )
+            reset_run_id(token)
+
+    async def _run_task_impl(
+        self,
+        user_input: str,
+        session_id: str = "default_session",
+        mode: str = "fast",
+        effort: str = "auto",
+        strategy: str = "auto",
+        auto_commit: bool | None = None,
+        resume: bool = False,
+        system_extra: str | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """
         Executes a user request with autonomous multi-step reasoning, tool execution,
@@ -1992,10 +2356,12 @@ class TitanAgent:
         auto_commit: None = instance default (env TITAN_GIT_AUTO_COMMIT); True/False
                 overrides. When on, workspace changes are committed after a
                 successful run (Aider-style git-first workflow).
-        resume: when True (Devin/Claude-Code-style continuity), the run restores
-                this session's checkpoint (live messages + step count) and
-                continues from where it stopped. A session already marked done
-                returns its saved final answer instead of re-running.
+        resume: when True, restore a saved checkpoint. Completed tool batches
+                continue with their preserved tool-call messages; if recovery
+                finds a batch or structured run that may have caused an
+                unrecorded side effect, execution pauses for manual
+                reconciliation instead of replaying it. Completed sessions
+                return their saved final answer.
         Yields AgentEvent objects for real-time streaming to Web UI / CLI.
         """
         if mode not in ("fast", "deep", "deep_search"):
@@ -2007,14 +2373,27 @@ class TitanAgent:
             strategy = "auto"
         auto_commit = self._auto_commit if auto_commit is None else auto_commit
 
-        # ---- Phase 5: a session already completed returns its saved result ----
-        if resume:
-            cp = self._checkpoint_load(session_id)
-            if cp is not None and cp.status == "done" and cp.final_answer:
-                yield AgentEvent("status", f"Session '{session_id}' already completed — returning saved result.")
-                yield AgentEvent("final_answer", cp.final_answer)
-                self.memory.add_message(session_id, "assistant", cp.final_answer)
-                return
+        # ---- Phase 5: completed runs return their saved result; ambiguous side effects never replay ----
+        resume_cp = self._checkpoint_load(session_id) if resume else None
+        if resume_cp is not None and resume_cp.status == "done" and resume_cp.final_answer:
+            yield AgentEvent("status", f"Session '{session_id}' already completed — returning saved result.")
+            yield AgentEvent("final_answer", resume_cp.final_answer)
+            self.memory.add_message(session_id, "assistant", resume_cp.final_answer)
+            return
+        if resume_cp is not None and resume_cp.status in {"tool_in_progress", "structured_in_progress"}:
+            pending_names = self._pending_tool_names(resume_cp.messages)
+            action_summary = ", ".join(pending_names) if pending_names else "structured strategy actions"
+            yield AgentEvent(
+                "status",
+                f"Session '{session_id}' paused for side-effect reconciliation; no pending action was replayed.",
+            )
+            yield AgentEvent(
+                "final_answer",
+                "Paused safely after an interrupted tool batch ("
+                f"{action_summary}). One or more external actions may have completed before the interruption. "
+                "Verify each real-world outcome first. For classic tool calls, record operator-verified results with CheckpointStore.reconcile_tool_batch before resuming; structured runs remain paused and need a fresh run. Nothing is replayed automatically.",
+            )
+            return
 
         # Dual-Shield Cyber Defense Evaluation (Blue Team continuous + Emergency Red Team)
         from titan_agent.core.security.dual_shield import DualShieldOrchestrator
@@ -2029,8 +2408,9 @@ class TitanAgent:
                 yield AgentEvent("final_answer", f"🛡️ **Blocked by Blue Team Sentinel**\n\n{block_msg}")
             return
 
-        # Save user message to memory
-        self.memory.add_message(session_id, "user", user_input)
+        # Avoid duplicating the original turn in long-term chat history on resume.
+        if resume_cp is None:
+            self.memory.add_message(session_id, "user", user_input)
 
         # Retrieve conversation history
         history = self.memory.get_recent_messages(session_id, limit=10)
@@ -2100,18 +2480,17 @@ class TitanAgent:
             messages.append(m_dict)
 
         # ---- Phase 5: Devin-style resume — restore the session's live state ----
-        if resume:
-            cp = self._checkpoint_load(session_id)
-            if cp is not None and cp.messages:
-                yield AgentEvent(
-                    "status",
-                    f"Resuming session '{session_id}' from checkpoint ({cp.steps_done} "
-                    f"steps done, last status: {cp.status}).",
-                )
-                messages = [
-                    {"role": m["role"], "content": m["content"]}
-                    for m in cp.messages
-                ][-CHECKPOINT_MAX_MESSAGES:]
+        if resume_cp is not None and resume_cp.messages:
+            yield AgentEvent(
+                "status",
+                f"Resuming session '{session_id}' from checkpoint ({resume_cp.steps_done} "
+                f"steps done, last status: {resume_cp.status}).",
+            )
+            messages = [
+                dict(message)
+                for message in resume_cp.messages
+                if isinstance(message, dict) and "role" in message
+            ][-CHECKPOINT_MAX_MESSAGES:]
         # Always-on checkpointing (Devin-style): persist run state so an interrupted
         # session can be resumed without losing work.
         self._checkpoint_save(
@@ -2121,7 +2500,8 @@ class TitanAgent:
             effort=effort,
             strategy=strategy,
             messages=messages,
-            steps_done=0,
+            steps_done=resume_cp.steps_done if resume_cp is not None else 0,
+            tools_used=resume_cp.tools_used if resume_cp is not None else [],
             status="running",
         )
 
@@ -2136,7 +2516,7 @@ class TitanAgent:
             try:
                 from .structured import StructuredEngine
                 engine = StructuredEngine(
-                    self.llm,
+                    _TraceAwareLLMClient(self, self.llm, "structured"),
                     self.execute_tool_unified,
                     self._build_tools_list,
                     session_id=session_id,
@@ -2147,6 +2527,26 @@ class TitanAgent:
                     defer_approval=True,
                 )
                 structured_context = self._build_structured_context(user_input, mode, effort)
+                structured_checkpointed = self._checkpoint_save(
+                    session_id=session_id,
+                    user_input=user_input,
+                    mode=mode,
+                    effort=effort,
+                    strategy=strategy,
+                    messages=messages,
+                    steps_done=0,
+                    status="structured_in_progress",
+                )
+                if not structured_checkpointed:
+                    yield AgentEvent(
+                        "error",
+                        "Structured execution was not started because its durable checkpoint could not be saved.",
+                    )
+                    yield AgentEvent(
+                        "final_answer",
+                        "Paused safely: structured tool execution requires writable checkpoint storage. No structured tools were run.",
+                    )
+                    return
                 async for ev in engine.run(
                     user_input,
                     context=structured_context,
@@ -2199,9 +2599,16 @@ class TitanAgent:
 
         yield AgentEvent("status", f"Planning and analyzing the task... (effort: {effort}, max steps: {max_steps})")
 
-        iteration = 0
-        used_tools = False
-        run_tools: list[str] = []
+        iteration = resume_cp.steps_done if resume_cp is not None else 0
+        checkpoint_context = {
+            "session_id": session_id,
+            "user_input": user_input,
+            "mode": mode,
+            "effort": effort,
+            "strategy": strategy,
+        }
+        used_tools = bool(resume_cp.tools_used) if resume_cp is not None else False
+        run_tools: list[str] = list(resume_cp.tools_used) if resume_cp is not None else []
         reflect_done = False
         postcheck_done = False  # Phase 26: bounded auto post-check for edit runs
         empty_retried = False   # Phase 30: bounded retry on whitespace-only finals
@@ -2326,7 +2733,9 @@ class TitanAgent:
                 ]
                 run_tools.extend(used_names)
                 _before_batch = len(messages)
-                async for ev in self._emit_tool_results(response, messages, iteration):
+                async for ev in self._emit_tool_results(
+                    response, messages, iteration, checkpoint_context=checkpoint_context
+                ):
                     yield ev
                 # Phase 37: feed the dead-end detector this batch's outcome
                 # (all-failed batches build the streak, any success resets it).
@@ -2377,7 +2786,7 @@ class TitanAgent:
                 self._checkpoint_save(
                     session_id=session_id, user_input=user_input, mode=mode,
                     effort=effort, strategy=strategy, messages=messages,
-                    steps_done=iteration, tools_used=used_names, status="running",
+                    steps_done=iteration, tools_used=run_tools, status="running",
                 )
 
                 # Check if iterations limit reached
@@ -2443,14 +2852,15 @@ class TitanAgent:
                         # Grounding decided real verification is needed — execute it
                         used_tools = True
                         async for ev in self._emit_tool_results(
-                            gresp, grounding_msgs, iteration
+                            gresp, grounding_msgs, iteration,
+                            checkpoint_context=checkpoint_context,
                         ):
                             yield ev
                         messages = grounding_msgs
                         self._checkpoint_save(
                             session_id=session_id, user_input=user_input, mode=mode,
                             effort=effort, strategy=strategy, messages=messages,
-                            steps_done=iteration, tools_used=["verification"],
+                            steps_done=iteration, tools_used=run_tools,
                             status="running",
                         )
                         if iteration >= max_steps:
@@ -2478,8 +2888,11 @@ class TitanAgent:
                     },
                 ]
                 try:
-                    crit = await self._critic_llm().chat_completion(
-                        critic_messages, tools=available_tools
+                    crit = await self._traced_chat_completion(
+                        self._critic_llm(),
+                        critic_messages,
+                        tools=available_tools,
+                        call_role="reflection",
                     )
                 except (RuntimeError, OSError, aiohttp.ClientError) as e:
                     yield AgentEvent("error", f"Reflection pass error: {e!s}")
@@ -2491,7 +2904,10 @@ class TitanAgent:
                     if crit.tool_calls:
                         # Reflection decided more work is needed — execute it
                         _before_batch = len(messages)
-                        async for ev in self._emit_tool_results(crit, messages, iteration):
+                        async for ev in self._emit_tool_results(
+                            crit, messages, iteration,
+                            checkpoint_context=checkpoint_context,
+                        ):
                             yield ev
                         # Phase 37: reflection-grinding counts toward the same
                         # dead-end streak as main-loop batches.
@@ -2499,7 +2915,7 @@ class TitanAgent:
                         self._checkpoint_save(
                             session_id=session_id, user_input=user_input, mode=mode,
                             effort=effort, strategy=strategy, messages=messages,
-                            steps_done=iteration, status="running",
+                            steps_done=iteration, tools_used=run_tools, status="running",
                         )
                         if iteration >= max_steps:
                             yield AgentEvent("final_answer", f"Reached the maximum number of steps ({max_steps}). The latest state and results are preserved above.")
@@ -2533,8 +2949,11 @@ class TitanAgent:
                                 {"role": "user", "content": REFINE_PROMPT},
                             ]
                             try:
-                                refined = await self.llm.chat_completion(
-                                    refine_messages, tools=available_tools
+                                refined = await self._traced_chat_completion(
+                                    self.llm,
+                                    refine_messages,
+                                    tools=available_tools,
+                                    call_role="refinement",
                                 )
                             except (RuntimeError, OSError, aiohttp.ClientError) as e:
                                 yield AgentEvent("error", f"Refinement pass error: {e!s}")
@@ -2547,7 +2966,8 @@ class TitanAgent:
                                 refine_handoff = True
                                 _before_batch = len(messages)
                                 async for ev in self._emit_tool_results(
-                                    refined, messages, iteration
+                                    refined, messages, iteration,
+                                    checkpoint_context=checkpoint_context,
                                 ):
                                     yield ev
                                 # Phase 37: refinement work counts toward the
@@ -2560,7 +2980,7 @@ class TitanAgent:
                             self._checkpoint_save(
                                 session_id=session_id, user_input=user_input, mode=mode,
                                 effort=effort, strategy=strategy, messages=messages,
-                                steps_done=iteration, tools_used=["refine"],
+                                steps_done=iteration, tools_used=run_tools,
                                 status="running",
                             )
                             if iteration >= max_steps:

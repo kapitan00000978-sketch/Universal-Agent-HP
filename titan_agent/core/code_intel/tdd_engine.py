@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
+import re
 import tempfile
 from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -61,30 +62,51 @@ class TDDExecutionReport:
 class AutonomousTDDEngine:
     """Executes rigorous Red-Green-Refactor cycles in hermetic temp sandboxes."""
 
-    def __init__(self, workspace_root: Path | str | None = None):
+    def __init__(
+        self,
+        workspace_root: Path | str | None = None,
+        sandbox_runner: Callable[[Path, Path, float], Awaitable[tuple[int, str, float]]] | None = None,
+    ):
         self.workspace_root = Path(workspace_root) if workspace_root else Path.cwd()
+        self.sandbox_runner = sandbox_runner
 
     async def _run_pytest_in_dir(self, test_path: Path, cwd: Path, timeout: float = 30.0) -> tuple[int, str, float]:
-        """Runs pytest on a test file and captures output."""
-        start = asyncio.get_event_loop().time()
-        cmd = [sys.executable, "-m", "pytest", str(test_path), "-v", "-s"]
+        """Run generated tests in the configured OS/container sandbox only."""
+        if self.sandbox_runner is None:
+            return 126, "Docker sandbox runner is not configured; generated tests were not executed.", 0.0
+        started = asyncio.get_running_loop().time()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            duration = asyncio.get_event_loop().time() - start
-            out = stdout_bytes.decode("utf-8", errors="ignore")
-            return proc.returncode or 0, out, duration
-        except asyncio.TimeoutError:
-            duration = asyncio.get_event_loop().time() - start
-            return 124, f"Pytest timed out after {timeout}s", duration
+            return await self.sandbox_runner(test_path, cwd, timeout)
         except Exception as exc:
-            duration = asyncio.get_event_loop().time() - start
-            return 1, f"Failed to execute pytest: {exc!s}", duration
+            duration = asyncio.get_running_loop().time() - started
+            log.warning("TDD sandbox runner failed: %s", exc)
+            return 125, f"TDD sandbox runner failed: {exc!s}", duration
+
+    @staticmethod
+    def _red_failure_is_expected(exit_code: int, output: str, module_name: str) -> bool:
+        """Count RED only when a test failed or collection found the missing API.
+
+        Syntax errors, missing third-party dependencies, timeouts, sandbox
+        failures, and truncated output are not evidence that the feature test
+        correctly detects the requested bug.
+        """
+        if exit_code in {0, 124, 125, 126}:
+            return False
+        missing_api = re.search(r"cannot import name '([^']+)' from '([^']+)'", output)
+        if missing_api is None:
+            missing_api = re.search(r'cannot import name "([^"]+)" from "([^"]+)"', output)
+        if missing_api and missing_api.group(2) == module_name:
+            return True
+        missing_attribute = re.search(r"module '([^']+)' has no attribute '([^']+)'", output)
+        if missing_attribute is None:
+            missing_attribute = re.search(r'module "([^"]+)" has no attribute "([^"]+)"', output)
+        if missing_attribute and missing_attribute.group(1) == module_name:
+            return True
+        # A failed test is not a meaningful RED result if collection/runtime
+        # broke for unrelated reasons, such as a dependency or malformed test.
+        if re.search(r"ModuleNotFoundError|No module named|SyntaxError|ERROR collecting|pytest: error:", output):
+            return False
+        return bool(re.search(r"(?m)^FAILED\s+[^\s:]+::", output))
 
     async def execute_tdd_cycle(
         self,
@@ -94,7 +116,10 @@ class AutonomousTDDEngine:
         code_filename: str = "feature.py",
         timeout: float = 30.0,
     ) -> TDDExecutionReport:
-        """Executes full RED -> GREEN -> REFACTOR validation in an isolated directory."""
+        """Execute RED/GREEN tests through the configured OS/container sandbox."""
+        for filename in (test_filename, code_filename):
+            if not filename or Path(filename).name != filename or filename in {".", ".."}:
+                raise ValueError("TDD filenames must be simple basenames inside the temporary workspace")
         with tempfile.TemporaryDirectory(prefix="titan_tdd_") as tmpdir:
             tmppath = Path(tmpdir)
             test_file = tmppath / test_filename
@@ -108,8 +133,11 @@ class AutonomousTDDEngine:
             test_file.write_text(test_code, encoding="utf-8")
 
             red_code, red_out, red_dur = await self._run_pytest_in_dir(test_file, tmppath, timeout=timeout)
-            # In TDD, the test MUST fail (exit code != 0) when the feature is not implemented
-            red_success = red_code != 0
+            # RED is valid only when pytest reports a failed test or an import/
+            # attribute failure for the intentionally empty feature module.
+            red_success = self._red_failure_is_expected(
+                red_code, red_out, Path(code_filename).stem
+            )
             red_stage = TDDStageResult(
                 stage="RED",
                 success=red_success,
@@ -122,7 +150,12 @@ class AutonomousTDDEngine:
             # Stage 2: GREEN PHASE (Implementation written, test must pass)
             # -------------------------------------------------------------
             code_file.write_text(implementation_code, encoding="utf-8")
-            green_code, green_out, green_dur = await self._run_pytest_in_dir(test_file, tmppath, timeout=timeout)
+            if not red_success:
+                green_code = 126
+                green_out = "Not run because RED did not demonstrate a valid failing test."
+                green_dur = 0.0
+            else:
+                green_code, green_out, green_dur = await self._run_pytest_in_dir(test_file, tmppath, timeout=timeout)
             green_success = green_code == 0
             green_stage = TDDStageResult(
                 stage="GREEN",

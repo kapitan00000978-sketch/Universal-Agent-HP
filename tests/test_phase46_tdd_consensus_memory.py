@@ -5,7 +5,9 @@ from titan_agent.agent import TitanAgent
 
 
 @pytest.mark.asyncio
-async def test_tool_registry_tdd_cycle(tmp_path):
+async def test_tool_registry_tdd_cycle(tmp_path, monkeypatch):
+    # Trusted fixture exercises the explicit FULL_ACCESS host-execution path.
+    monkeypatch.setenv("TITAN_FULL_ACCESS", "1")
     registry = ToolRegistry(workspace=tmp_path)
 
     test_code = """

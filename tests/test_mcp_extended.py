@@ -1,4 +1,5 @@
 """Extended MCP config tests (Block 5: Hermes-class MCP server baseline)."""
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -103,3 +104,58 @@ def test_obsidian_config_uses_env_placeholder_for_vault():
     assert obs["command"] == "npx"
     assert "--vault" in obs["args"]
     assert any("OBSIDIAN_VAULT" in a for a in obs["args"])
+
+
+def test_dynamic_preset_connect_uses_live_manager_and_does_not_persist_secret(tmp_path, monkeypatch):
+    secret_url = "postgresql://private-user:private-password@db.invalid/private"
+    monkeypatch.setenv("POSTGRES_URL", secret_url)
+    config_file = tmp_path / "mcp_servers.json"
+    mgr = MCPManager(config_file)
+
+    async def fake_start_one(conn):
+        conn.is_connected = True
+        conn.tools = [{"name": "query", "inputSchema": {"type": "object"}}]
+        mgr.servers[conn.name] = conn
+        return True
+
+    monkeypatch.setattr(mgr, "_start_one", fake_start_one)
+
+    ok, message = asyncio.run(
+        mgr.connect_preset(
+            "postgres",
+            server_name="pg_live",
+            env_overrides={"POSTGRES_URL": "{POSTGRES_URL}"},
+            workspace_dir=tmp_path,
+        )
+    )
+
+    assert ok is True
+    assert "connected" in message
+    assert "pg_live" in mgr.servers
+    saved_config = config_file.read_text(encoding="utf-8")
+    assert secret_url not in saved_config
+    assert "private-password" not in saved_config
+
+
+def test_dynamic_preset_refuses_inline_credentials(tmp_path, monkeypatch):
+    mgr = MCPManager(tmp_path / "mcp_servers.json")
+    called = False
+
+    async def should_not_start(_conn):
+        nonlocal called
+        called = True
+        return True
+
+    monkeypatch.setattr(mgr, "_start_one", should_not_start)
+    ok, message = asyncio.run(
+        mgr.connect_preset(
+            "postgres",
+            env_overrides={"POSTGRES_URL": "postgresql://user:secret@localhost/db"},
+            workspace_dir=tmp_path,
+        )
+    )
+
+    assert ok is False
+    assert "Refusing inline value" in message
+    assert called is False
+    assert not (tmp_path / "mcp_servers.json").exists()

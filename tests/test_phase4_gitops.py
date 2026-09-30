@@ -134,7 +134,8 @@ def test_agent_tool_catalog_includes_git_tools():
     assert {"git_status", "git_diff", "git_commit"} <= names
 
 
-def test_dispatch_git_tools_through_agent(tmp_path):
+def test_dispatch_git_tools_through_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("TITAN_FULL_ACCESS", "true")
     repo = _init_repo(tmp_path)
     (repo / "build.txt").write_text("v2")
     agent = TitanAgent(llm=FakeLLM(), git_root=repo)
@@ -151,7 +152,8 @@ def test_dispatch_git_tools_through_agent(tmp_path):
     assert "working tree clean" in out_final
 
 
-def test_git_commit_tool_requires_message(tmp_path):
+def test_git_commit_tool_requires_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("TITAN_FULL_ACCESS", "true")
     repo = _init_repo(tmp_path)
     agent = TitanAgent(llm=FakeLLM(), git_root=repo)
     out = asyncio.run(agent.execute_tool_unified("git_commit", {}))
@@ -161,7 +163,8 @@ def test_git_commit_tool_requires_message(tmp_path):
 # ---------- end-to-end: auto-commit + core memory ----------
 
 
-def test_run_task_auto_commit_end_to_end(tmp_path):
+def test_run_task_auto_commit_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("TITAN_FULL_ACCESS", "true")
     repo = _init_repo(tmp_path)
     (repo / "build.txt").write_text("v1")
     _git(repo, "add", "-A")
@@ -182,6 +185,25 @@ def test_run_task_auto_commit_end_to_end(tmp_path):
     assert any(ev.type == "final_answer" for ev in events)
     assert "agent: update the build file" in _git(repo, "log", "--oneline", "-1")
     assert git_status(repo) == "(working tree clean)"
+
+
+def test_auto_commit_fails_closed_without_hitl(tmp_path, monkeypatch):
+    monkeypatch.delenv("TITAN_FULL_ACCESS", raising=False)
+    monkeypatch.delenv("TITAN_ABSOLUTE_ACCESS", raising=False)
+    repo = _init_repo(tmp_path)
+    (repo / "build.txt").write_text("v1")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "seed")
+    (repo / "build.txt").write_text("v2")
+
+    agent = TitanAgent(llm=FakeLLM(), git_root=repo, auto_commit=True)
+
+    async def _run():
+        return [ev async for ev in agent.run_task("update the build file", session_id="auto-no-hitl", mode="fast")]
+
+    asyncio.run(_run())
+    assert "seed" in _git(repo, "log", "--oneline", "-1")
+    assert "build.txt" in git_status(repo)
 
 
 def test_run_task_writes_core_memory_and_recalls(tmp_path):

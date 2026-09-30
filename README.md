@@ -4,18 +4,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Architecture: Tri--Loop](https://img.shields.io/badge/Architecture-Tri--Loop%20Metacognition-purple.svg)](#architecture-genesis-10-level-cognitive-swarm-hierarchy-levels-1---10)
-[![Tests: 690+ Passing](https://img.shields.io/badge/tests-690%2B%20passing-brightgreen.svg)](#testing--security)
+[![Tests: 750+ Passing](https://img.shields.io/badge/tests-750%2B%20passing-brightgreen.svg)](#testing--security)
 
-Universal Agent HP is an autonomous AI software engineering and operations operating system built for real-world production environments. It fuses **Tri-Loop Metacognitive Reasoning**, an **Autonomous TDD Engine**, **Anthropic Model Context Protocol (MCP)** integration, **Human-in-the-Loop Guardrails**, and **Local Semantic Caching** into a verified, drift-free execution framework.
+Universal Agent HP is an AI agent framework for software engineering and operations workflows. It includes planning and reflection components, a TDD workflow, Model Context Protocol (MCP) integration, human-approval gates, and an optional local query cache. These capabilities depend on configuration and external services; passing tests or using these components does not certify production readiness, correctness, or regulatory compliance.
 
 ```
    ┌────────────────────────────────────────────────────────────────────────┐
    │                         UNIVERSAL AGENT HP                             │
    │                                                                        │
-   │   [System 1: Fast Intuition] ──> Instant Heuristic Path (0ms)          │
-   │   [System 2: Planning Engine] ──> MCTS + Bayes Reasoning + TDD Loop     │
-   │   [System 3: Metacognitive]   ──> Shannon Entropy + Dynamic Synthesis  │
-   │   [Active Working Memory]     ──> Pinned Operational HUD (No Drift)    │
+   │   [System 1: Fast Intuition] ──> Heuristic response path                │
+   │   [System 2: Planning Engine] ──> Planning strategies + TDD workflow    │
+   │   [System 3: Metacognitive]   ──> Reflection and strategy revision     │
+   │   [Active Working Memory]     ──> Session context and memory           │
    └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -27,67 +27,57 @@ Universal Agent HP is engineered to solve acute, real-world engineering bottlene
 
 ### 1. Autonomous Software Engineering & Self-Healing Bug Fixes
 * **The Problem:** Developers spend hours manually isolating bugs, crafting regression tests, and repeatedly testing code fixes.
-* **Universal Agent Solution:** Upon receiving an issue or bug report, the agent executes an autonomous **TDD cycle**: writes a failing verification test (`pytest`), confirms failure (RED), writes minimal passing code (GREEN), and asserts AST safety invariants (REFACTOR). If tests fail, the self-healing loop autonomously debugs and iterates until 100% green.
+* **Universal Agent Solution:** The optional **TDD cycle** stages RED/GREEN tests and static invariants. Generated tests use the configured Docker sandbox in normal mode; explicit `TITAN_FULL_ACCESS` runs tests on the host. A bounded repair loop may try again after failures. Passing tests are evidence for that run, not a guarantee of correctness.
 
 ### 2. Safe GitOps: Automated Feature Branching & Pull Requests
 * **The Problem:** Blind AI code agents directly writing to `main` or committing unverified code can compromise codebase stability.
-* **Universal Agent Solution:** Isolates all development inside dedicated `agent/feature-<slug>` branches. The commit engine enforces a strict pass gate on the test suite before any git commit is permitted. Once verified, it automatically opens a formatted, context-rich Pull Request via `gh pr create`.
+* **Universal Agent Solution:** Optional Git workflows can create feature branches, run a configured test command, commit, and open a pull request through `gh`. These are configuration-dependent integrations, not a guarantee that all work is isolated or verified; review the selected branch, test command, diff, and PR before merging.
 
 ### 3. One-Line Ecosystem Integration (Anthropic Model Context Protocol)
 * **The Problem:** Writing custom API adapters for disparate enterprise databases and services is slow and error-prone.
-* **Universal Agent Solution:** Standardized MCP client enables 1-line connection to any industry-standard server:
-  * `postgres`: Direct SQL inspection, schema analysis, and migrations
-  * `github`: Repository management, issues, and PR workflows
-  * `slack`: Real-time alerts, messaging, and team collaboration
-  * `brave_search`: Live web search for latest documentation and dependencies
-  * `filesystem` & `sqlite`: Secure local sandboxes and query engines
+* **Universal Agent Solution:** The MCP client can connect to configured MCP servers (for example Postgres, GitHub, Slack, search, filesystem, or SQLite servers). Each server's tools and permissions are deployment-specific; connecting one does not make it a secure sandbox.
 
 ### 4. Halting Catastrophic Actions (Human-in-the-Loop Safety)
 * **The Problem:** AI agents inadvertently executing destructive commands (`rm -rf`, `delete_file`, `git push --force`, or leaking credentials in `.env`).
-* **Universal Agent Solution:** The `DangerousActionClassifier` intercepts irreversible actions and halts execution, prompting the operator across Terminal TUI, Web Dashboard, or Telegram:
-  > *"I am about to execute a destructive operation. Do you authorize this action? [Yes / No]"*  
-  Zero destructive actions execute without explicit human authorization.
+* **Universal Agent Solution:** Named dangerous-command rules block selected patterns, while selected high-impact actions and every MCP call require an active human-approval manager in normal mode. Missing or failed approval fails closed. This is not a complete semantic detector for every destructive action, and `TITAN_FULL_ACCESS` / `TITAN_ABSOLUTE_ACCESS` explicitly bypass approval controls; run only with trusted inputs and review configuration.
 
-### 5. Slashing LLM Token Costs by 30–40% (Semantic Caching)
+### 5. Optional semantic cache
 * **The Problem:** Repetitive tool calls, static file reads, and semantically equivalent queries needlessly burn expensive model tokens.
-* **Universal Agent Solution:** An embedded SQLite vector cache (`semantic_cache.db`) calculates word cosine similarity, returning **0ms** responses for matching or near-equivalent requests, cutting LLM bills by 30–40% with live token and dollar savings telemetry.
+* **Universal Agent Solution:** The optional SQLite cache supports exact-query reuse and a lexical fuzzy-match path based on word-frequency similarity (not embedding-based semantic understanding). Similarity matches can return stale or inappropriate responses, so configure its threshold and scope carefully. Any latency or cost savings depend on workload; none are claimed without a measured workload benchmark.
 
 ### 6. Continuous Learning from Historical Mistakes (Episodic Experience Replay)
 * **The Problem:** Most AI agents repeat identical syntax, version conflict, and dependency errors across different sessions.
-* **Universal Agent Solution:** Maintains an episodic failure repository (`experience_replay.db`). When runtime exceptions occur, it records normalized error fingerprints and verified remediation diffs, instantly recalling proven solutions when encountering similar errors in the future.
+* **Universal Agent Solution:** An optional experience-replay store records error fingerprints and associated remediation notes. It can surface related past entries; retrieved suggestions require review and are not inherently verified or guaranteed to fix a recurrence.
 
-### 7. 100% Private & Air-Gapped Local AI
-* **The Problem:** Organizations cannot expose proprietary source code to public third-party cloud APIs.
-* **Universal Agent Solution:** First-class native integration with `Ollama` and `LM Studio` runs models entirely locally on your hardware. Zero bytes leave your infrastructure.
+### 7. Local model option
+* **The Problem:** Organizations may need to keep model prompts and source code on their own infrastructure.
+* **Universal Agent Solution:** TITAN supports local providers such as Ollama and LM Studio. A local model alone does not make every tool or integration offline: disable network tools, MCP servers, and outbound services as required, then validate egress at the OS/container boundary.
 
 ---
 
 ## Transparent Capabilities: What It Can and Cannot Do
 
-### ✅ Real, Verified Capabilities (Backed by 675+ Passing Tests):
-1. **Tri-Loop Metacognitive Reasoning Engine:**
-   * **System 1 (Fast Intuition):** 0ms instant heuristic dispatch bypassing tool execution for direct conversational prompts.
-   * **System 2 (Deliberative Planning):** Tree-of-Thoughts, Multi-Hop ReAct, and Monte Carlo Tree Search (MCTS) with Bayesian hypothesis tracking.
-   * **System 3 (Metacognitive Overseer):** Real-time monitoring of Shannon cognitive entropy and stagnation breakers that autonomously pivot strategy when stuck.
-2. **Surgical AST Code Patching:** Identifies exact AST target nodes to replace functions and classes without line-number offset errors.
-3. **Symbolic AST Safety Scanner:** Statically detects unbounded `while True` loops, dangerous shell injections (`subprocess` with `shell=True`), and resource leaks before code execution.
-4. **Three Production-Ready Interfaces:**
+### ✅ Implemented capabilities and verification evidence:
+1. **Planning and reflection components:** Includes multiple planning strategies, tool-driven reasoning, and optional reflection; behavior depends on the selected model and workflow.
+2. **AST-aware code operations:** Provides AST-based helpers for targeting code elements and bounded, non-executing Python file/repository analysis (module structure, symbols, and local imports). Static summaries can miss dynamic runtime behavior; inspect the diff and run tests before accepting edits.
+3. **Static AST checks:** The checker flags configured patterns such as selected unbounded loops or `subprocess` calls with `shell=True`. Static checks are heuristic and do not prove code safe or detect every resource leak.
+4. **Available interfaces (deployment readiness depends on configuration):**
    * **Terminal TUI:** Full-screen Textual dark interface (`python run.py`).
    * **Mission Control Web Dashboard:** Real-time visual control panel with SSE telemetry (`python run.py --web`).
    * **Interactive Terminal CLI & Telegram:** Lightweight console shell and remote mobile bot.
-5. **Comprehensive Automated Verification:** 690+ unit and integration tests verified 100% green on every commit via GitHub Actions CI across Python 3.11 and 3.12.
+5. **Automated regression suite:** 802 tests passed in the latest local run on 2026-09-30. This validates covered code paths, not production safety; Docker-backed execution was tested through mocked command construction only because no Docker daemon was available.
 6. **Multimedia & 3D Engineering (Video Montage & Blender bpy):**
    * **Automated Video Editing:** Zero-loss cuts (`-c copy`), dynamic aspect ratio conversion (16:9 to vertical 9:16 for Reels/Shorts/TikTok), multi-track audio sync, and speed alterations powered by `VideoEngine` and FFmpeg.
    * **Headless Blender 3D (bpy):** Procedural 3D mesh synthesis (cubes, spheres, cylinders, toruses), PBR material assignment (`Principled BSDF`), 3-point studio lighting, and background batch rendering via `BlenderEngine`.
 7. **Omni-Domain Industry Adaptation Framework:**
-   * **Any Field / Any Industry:** Pre-configured operational profiles for Software Engineering, Finance & Banking, Healthcare & Medicine, Legal & Compliance, Marketing & Growth, Scientific Research, Education & Pedagogy, E-Commerce & Retail, Customer Support, Multimedia & 3D, and Cybersecurity.
-   * **Domain-Specific Guardrails & Overlays:** Injects statutory compliance, ethical disclaimers (financial risk disclosures, clinical safety disclaimers, legal counsel notices), and tailored methodologies into both system prompts and cognitive reasoning passes.
-   * **Dynamic Custom Domain Builder:** Create, customize, and persist tailored enterprise profiles (`domain_create`, `.titan/domains/*.json`) with instant on-the-fly switching via `--domain <name>` or `/domain`.
+   * **Included Profiles:** Configurable domain prompt profiles for Software Engineering, Finance & Banking, Healthcare & Medicine, Legal & Compliance, Marketing & Growth, Scientific Research, Education & Pedagogy, E-Commerce & Retail, Customer Support, Multimedia & 3D, and Cybersecurity.
+   * **Domain-Specific Prompt Overlays:** Adds configurable instructions, examples, and disclaimer text to prompts. These are guidance only and do not enforce compliance, privacy, or factual accuracy.
+   * **Dynamic Custom Domain Builder:** Create, customize, and persist tailored enterprise profiles (`domain_create`, `.titan/domains/*.json`) with runtime selection via `--domain <name>` or `/domain`.
 
 ### ⚠️ Realistic Boundaries & Limitations:
 1. **Requires an LLM Engine:** Universal Agent HP is a cognitive orchestration and verification operating system; underlying reasoning power depends on the connected model (Claude 3.5 Sonnet, GPT-4o, DeepSeek, or local Llama 3).
-2. **Destructive Operations Require Consent:** By design, the agent cannot bypass security guardrails or execute destructive operations without operator authorization.
-3. **Third-Party Provider Rate Limits:** When external commercial APIs experience rate limits or outages, the agent falls back to cached responses or configured fallback providers.
+2. **Explicit trust modes matter:** Normal mode applies policy checks and fail-closed approval gates for selected high-impact actions; it is not a guarantee that every destructive action is recognized. Dynamic tool synthesis is opt-in and generated code is verified and invoked through Docker, but container isolation has not been validated here. `TITAN_FULL_ACCESS` and `TITAN_ABSOLUTE_ACCESS` intentionally relax or bypass protections.
+3. **External dependencies:** Model quality, availability, latency, and cost depend on the configured provider, network, and fallback setup.
 
 ---
 
@@ -109,6 +99,25 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+The standard `requirements.txt` setup installs the keyless upstream Laya decision runtime; it installs Laya-MLX only on Apple Silicon macOS. If you install only the core package, add an optional no-API-key **typed decision** backend (not a general chat/code generator):
+
+```bash
+# Cross-platform PyTorch Laya; model weights download on first use
+pip install -e '.[laya]'
+
+# Apple Silicon only: native MLX runtime
+pip install -e '.[laya-mlx]'
+
+python -m titan_agent.laya_decisions --state "I was charged twice; please refund one payment." --questions examples/laya-questions.json
+```
+
+The `laya_decide` tool and `titan-laya-decide` CLI run choice, score, and yes/no inference locally without an API key. The first run needs internet access to fetch checkpoint weights. TITAN uses the published [Laya](https://github.com/NandhaKishorM/laya) and [Laya-MLX](https://github.com/mizorewww/laya-mlx) packages; their source is not copied into this repository. Laya does **not** generate free-form chat answers or code; for a fully keyless coding/chat agent install and run a local generative model through Ollama or LM Studio.
+
+For local stdio MCP servers, install **Node.js/npm** (`npx`) and **uv** (`uvx`)
+on the host. The Docker image installs these runtimes. Configured MCP servers
+also need any server-specific credentials and, on first launch, package access
+to npm/PyPI unless the packages are already cached.
+
 ### 2. Configuration
 
 Copy the template configuration and configure your model provider:
@@ -117,11 +126,43 @@ Copy the template configuration and configure your model provider:
 cp .env.example .env
 ```
 
-For 100% offline execution with local Ollama:
+For a local model provider (tool network access is configured separately):
 ```env
 TITAN_PROVIDER=ollama
 TITAN_MODEL=llama3:latest
 ```
+
+### Command execution and safety boundaries
+
+Ordinary shell tool calls run in Docker by default (`python:3.12-slim`, no
+container network, read-only container root, dropped Linux capabilities, process,
+CPU, and memory limits). The configured workspace is mounted read/write because
+that is where agent edits and tests occur. Docker must be installed and
+available to the agent process; if Docker or the configured image is missing,
+execution fails closed. Images are never pulled automatically. Build the local
+sandbox image once:
+
+```bash
+docker build -f Dockerfile.sandbox -t titan-agent-sandbox:local .
+```
+
+That image includes pytest and common agent/test dependencies. For projects
+with additional dependencies, create a derived image and point
+`TITAN_COMMAND_SANDBOX_IMAGE` at its locally built tag. Network remains disabled
+inside the running container unless an explicitly approved tool uses bridge
+networking.
+
+`TITAN_FULL_ACCESS=1` (or `TITAN_ABSOLUTE_ACCESS=1`) is an explicit trusted-mode
+bypass: command calls run on the host and workspace path restrictions are
+lifted. Use it only in a disposable or otherwise trusted environment. It also
+retains the existing approval bypass.
+
+Selected high-impact operations and **all MCP tool calls** require an active
+human-approval manager in normal mode; missing, timed-out, or failed approval
+blocks execution. Checkpoint recovery of interrupted classic tool batches is
+manual: verify each external outcome, then submit exact results through the
+authenticated `POST /api/checkpoints/{session_id}/reconcile` endpoint before
+resuming. Structured runs remain paused and must be started as a fresh run.
 
 ---
 
@@ -192,7 +233,7 @@ Universal Agent HP processes every complex engineering task through a discipline
 │   └── Shannon entropy telemetry: cyclic stagnation & dead-end breaks     │
 │                                │                                         │
 │                                ▼                                         │
-│  [06. GitOps Delivery & Verified PR]                                     │
+│  [06. GitOps Delivery & PR Workflow]                                    │
 │   ├── Clean feature branch isolation (agent/feature-<slug>)              │
 │   ├── Test-suite pass gated atomic git commit                            │
 │   └── Automated, fully documented Pull Request (PR) opening on GitHub    │
@@ -275,7 +316,7 @@ graph TD
   * **Level 6: Causal Knowledge Graph & Blast-Radius:** Maps codebase dependencies and predicts ripple effects of proposed modifications.
   * **Level 7: Dynamic Tool Discovery & Reliability EWMA:** Evaluates tool execution stability using exponentially weighted moving averages and synthesizes new tools on-the-fly.
   * **Level 8: 500+ Model Capability Routing & Budget:** Optimizes model selection per subtask to balance latency, reasoning depth, and cost.
-  * **Level 9: SHA-256 Zero-Loss Filesystem Rollback:** Takes cryptographic state snapshots prior to modifications, enabling instant 0ms restoration upon failure.
+  * **Level 9: Snapshot-Based Workspace Rollback:** Can snapshot workspace state before selected actions and attempt restoration after failure; this is not a substitute for version control or an independent backup.
   * **Level 10: Drift Detection & Self-Improvement Suite:** Continuously monitors for cognitive context drift and refines system rules over time.
 
 ---
@@ -307,11 +348,11 @@ The Omni-Domain subsystem operates as a high-priority steering, compliance, and 
 │   └── Custom Store         : Dynamic enterprise profiles loaded from `.titan/domains/` │
 │                                │                                                       │
 │                                ▼                                                       │
-│   [Cognitive Overlay Injection Pipeline]                                               │
-│   ├── System 1 (Intuition) : Direct heuristic tone and vocabulary calibration          │
-│   ├── System 2 (Planning)  : Domain-specific methodology (IRAC, GAAP, PubMed, AIDA)    │
-│   ├── System 3 (Overseer)  : Metacognitive checks enforcing compliance & truthfulness │
-│   └── Prompt Steering      : Mandatory regulatory guardrails injected into HUD         │
+│   [Configurable Domain Prompt Overlays]                                                │
+│   ├── System 1 (Intuition) : Heuristic tone and vocabulary hints                       │
+│   ├── System 2 (Planning)  : Example methodologies (IRAC, GAAP, PubMed, AIDA)         │
+│   ├── System 3 (Overseer)  : Reflection prompts                                        │
+│   └── Prompt Steering      : Guidance text; not an enforced compliance control         │
 │                                │                                                       │
 │                                ▼                                                       │
 │   [Tool Scoping & Policy Gating]                                                       │
@@ -319,38 +360,38 @@ The Omni-Domain subsystem operates as a high-priority steering, compliance, and 
 │   └── Restriction Gate     : Forbidden tools intercepted via `is_tool_allowed()`       │
 │                                │                                                       │
 │                                ▼                                                       │
-│   [Verified Compliant Industry Delivery]                                               │
+│   [Domain-Guided Outputs (review required)]                                            │
 │   ├── Financial Models     : DCF, WACC, GAAP/IFRS balance sheets + non-advisory notice │
 │   ├── Legal Briefs         : IRAC structured briefs + non-counsel regulatory notice    │
-│   ├── Healthcare Analyses  : Peer-reviewed citations (PubMed/Lancet) + HIPAA privacy   │
+│   ├── Healthcare Analyses  : Research prompts; verify citations and privacy controls   │
 │   └── Media & 3D Assets    : Lossless FFmpeg cuts & headless Blender scripts           │
 │                                                                                        │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Cross-Industry Domain Matrix
+### 2. Available Domain Profiles
 
-The framework comes pre-loaded with 12 production-grade industry profiles:
+The repository includes 12 configurable domain profiles. Their prompt guidance is not a substitute for professional review, legal obligations, or verified compliance controls:
 
-| Domain | Icon | Aliases | Operational Methodology | Mandatory Regulatory Guardrail | Preferred Tools |
+| Domain | Icon | Aliases | Example methodology | Example prompt guidance (not an enforced control) | Preferred Tools |
 | :--- | :---: | :--- | :--- | :--- | :--- |
 | **Universal** | 🌐 | `all`, `general` | Dynamic multi-disciplinary reasoning adapting across all human knowledge and technical tasks | Verify facts and cite sources across all empirical claims | `execute_command`, `read_file`, `write_file`, `web_search` |
-| **Software Engineering** | 💻 | `dev`, `code`, `coding` | AST surgical patching, clean architecture, TDD cycles, isolated GitOps branches | Zero AST security violations, credential protection, HITL destructive approval | `deep_coder`, `execute_command`, `edit_file`, `workspace_rag` |
-| **Finance & Banking** | 📈 | `fin`, `money` | DCF valuations, WACC, sensitivity modeling, GAAP/IFRS financial statements | **Non-Advisory Disclaimer**: Educational only; zero unauthorized live transactions | `python_eval`, `web_search`, `scrape_webpage`, `read_file` |
-| **Healthcare & Medicine** | ⚕️ | `med`, `health` | Evidence-based synthesis, PubMed/Lancet citations, pharmacological mechanisms | **Clinical Safety Disclaimer**: Educational/research only; strict HIPAA privacy | `web_search`, `deep_search`, `scrape_webpage`, `python_eval` |
-| **Legal & Compliance** | ⚖️ | `law` | IRAC/CREAC structuring, contract clause scrutiny, GDPR/HIPAA/SOC 2 regulatory mapping | **Legal Counsel Disclaimer**: Structural research only; zero document leakage | `workspace_rag`, `read_file`, `write_file`, `web_search` |
+| **Software Engineering** | 💻 | `dev`, `code`, `coding` | AST surgical patching, clean architecture, TDD cycles, isolated GitOps branches | Review static-check findings, protect credentials, review approval prompts | `deep_coder`, `execute_command`, `edit_file`, `workspace_rag` |
+| **Finance & Banking** | 📈 | `fin`, `money` | DCF valuations, WACC, sensitivity modeling, GAAP/IFRS financial statements | **Non-advisory guidance**: Educational use; independently review all decisions | `python_eval`, `web_search`, `scrape_webpage`, `read_file` |
+| **Healthcare & Medicine** | ⚕️ | `med`, `health` | Evidence-based synthesis, PubMed/Lancet citations, pharmacological mechanisms | **Clinical caution**: Research support only; assess privacy and clinical controls separately | `web_search`, `deep_search`, `scrape_webpage`, `python_eval` |
+| **Legal & Compliance** | ⚖️ | `law` | IRAC/CREAC structuring, contract clause scrutiny, GDPR/HIPAA/SOC 2 regulatory mapping | **Legal caution**: Research support only; no legal advice or privacy guarantee | `workspace_rag`, `read_file`, `write_file`, `web_search` |
 | **Marketing & Growth** | 📢 | `mark` | AIDA, PAS, and StoryBrand frameworks, SEO search intent hierarchy, viral hooks | Truth in advertising; zero deceptive metrics, clickbait, or spam | `web_search`, `scrape_webpage`, `read_file`, `write_file` |
-| **Scientific Research** | 🔬 | `sci` | Falsifiable hypotheses, LaTeX mathematical notation, statistical significance (p-values) | Strict academic integrity; zero synthetic citations or hallucinated papers | `python_eval`, `web_search`, `deep_search`, `scrape_webpage` |
+| **Scientific Research** | 🔬 | `sci` | Falsifiable hypotheses, LaTeX mathematical notation, statistical significance (p-values) | Verify citations and distinguish sourced facts from generated text | `python_eval`, `web_search`, `deep_search`, `scrape_webpage` |
 | **Education & Pedagogy** | 🎓 | `edu` | Socratic inquiry, progressive hints, Feynman technique intuitive analogies | Active comprehension over homework cheating; age-appropriate guidance | `web_search`, `python_eval`, `read_file`, `write_file` |
 | **E-Commerce & Retail** | 🛒 | `shop`, `store` | Conversion-focused copywriting, unit economics (CAC, LTV, ROAS), inventory modeling | Consumer protection disclosures, clear warranty/return terms, order privacy | `web_search`, `scrape_webpage`, `python_eval`, `read_file` |
 | **Customer Support** | 🎧 | `help`, `support` | Empathetic communication, first-contact resolution, de-escalation, knowledge-base FAQs | Never request user credentials; structured tier-2 escalation protocols | `read_file`, `write_file`, `workspace_rag`, `web_search` |
 | **Multimedia & 3D** | 🎬 | `video`, `blender` | Lossless FFmpeg stream-copy cuts (`-c copy`), 9:16 mobile formats, headless Blender `bpy` | Non-destructive source media protection; disk storage exhaustion checks | `video_probe`, `video_montage_command`, `blender_generate_scene` |
-| **Cybersecurity & SecOps**| 🛡️ | `sec`, `security` | OWASP Top 10 SAST audits, dependency supply-chain scanning, high-entropy secret detection| Defensive mitigation and confidential disclosure; zero unauthorized exploits | `sast_scan`, `secret_scan`, `dependency_audit`, `workspace_rag` |
+| **Cybersecurity & SecOps**| 🛡️ | `sec`, `security` | OWASP Top 10 SAST audits, dependency supply-chain scanning, high-entropy secret detection| Defensive security guidance; validate scope and authorization | `sast_scan`, `secret_scan`, `dependency_audit`, `workspace_rag` |
 
 ### 3. Practical Usage & Domain Switching
 
 #### Option A: Command-Line Interface (Startup Flag)
-Start Universal Agent HP pre-configured for any industry:
+Start Universal Agent HP with one of the included domain profiles:
 ```bash
 # Launch in Finance & Quantitative Modeling mode
 python run.py --domain finance
@@ -412,7 +453,7 @@ Organizations can define custom domain profiles with bespoke regulatory guardrai
 Universal Agent HP includes dedicated skills, engines, and tool interfaces for automated video production and headless 3D asset generation:
 
 ### 1. Automated Video Editing Engine (`VideoEngine`)
-* **Lossless Stream-Copy Trimming:** Generates instant zero-reencoding cuts using FFmpeg `-c copy`.
+* **Video Editing Recipes:** Can generate FFmpeg stream-copy (`-c copy`) or re-encoding command recipes; stream-copy cut points may be constrained by codec keyframes and require output verification.
 * **Aspect Ratio & Platform Targeting:** Re-encodes horizontal footage (16:9) to vertical format (9:16, 1080x1920) optimized for YouTube Shorts, Instagram Reels, and TikTok.
 * **Audio Track Synchronization:** Multi-channel audio mixing (`amix`), volume normalization, and background music blending.
 * **Playback Velocity Modulation:** Video speed adjustment using `setpts` filters and pitch-corrected audio re-timing via `atempo`.
@@ -435,7 +476,7 @@ Universal Agent HP includes dedicated skills, engines, and tool interfaces for a
 
 ## Testing & Security
 
-* **Automated Test Suite:** Execute tests via `pytest tests/ -q` (**690+ unit and integration tests passing 100% green**).
+* **Automated Test Suite:** Run `pytest tests/ -q`. Latest local verification: **802 passed**; test coverage does not certify container isolation or production safety.
 * **Integrated Security:** AST invariant verification, secret scanning, and destructive command interception are embedded directly into the execution pipeline.
 
 ---

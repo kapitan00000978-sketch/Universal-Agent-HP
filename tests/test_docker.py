@@ -25,10 +25,13 @@ def test_dockerfile_has_valid_base_and_entrypoint() -> None:
     assert "import titan_agent.server" in dockerfile
 
 
-def test_dockerfile_installs_system_git() -> None:
+def test_dockerfile_installs_system_git_and_mcp_node_runtime() -> None:
     dockerfile = _read("Dockerfile")
     assert "git" in dockerfile
     assert "ca-certificates" in dockerfile
+    assert "nodejs" in dockerfile
+    assert "npm" in dockerfile
+    assert "uv>=" in _read("requirements.txt")
 
 
 def test_compose_mounts_workspace_and_healthchecks() -> None:

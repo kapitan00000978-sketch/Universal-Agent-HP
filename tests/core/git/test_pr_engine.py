@@ -1,6 +1,8 @@
 import subprocess
 from pathlib import Path
+
 import pytest
+
 from titan_agent.core.git.pr_engine import GitPREngine
 
 
@@ -54,3 +56,61 @@ def test_git_pr_engine_test_gated_commit(tmp_path):
     )
     assert ok2 is False
     assert "Tests failed before commit" in msg2
+
+
+def _mock_push(monkeypatch, engine, repo):
+    monkeypatch.setattr(engine, "_get_repo", lambda: (repo, ""))
+    monkeypatch.setattr(engine, "get_current_branch", lambda: "agent/feature-test")
+    monkeypatch.setattr(
+        "titan_agent.core.git.pr_engine._run",
+        lambda *args, **kwargs: (0, "pushed"),
+    )
+
+
+def test_pr_body_does_not_claim_unrun_checks_passed(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    engine = GitPREngine(workspace_root=repo)
+    _mock_push(monkeypatch, engine, repo)
+    monkeypatch.setattr("titan_agent.core.git.pr_engine.shutil.which", lambda _: "/usr/bin/gh")
+    monkeypatch.setattr(
+        "titan_agent.core.git.pr_engine.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "https://example.test/pr/1\n", ""),
+    )
+
+    result = engine.create_pull_request("Example change")
+
+    assert result.success is True
+    assert result.pr_url == "https://example.test/pr/1"
+    assert "not run by the PR engine" in result.pr_body
+    assert "100% passing" not in result.pr_body
+
+
+def test_pr_creation_failure_is_not_reported_as_success(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    engine = GitPREngine(workspace_root=repo)
+    _mock_push(monkeypatch, engine, repo)
+    monkeypatch.setattr("titan_agent.core.git.pr_engine.shutil.which", lambda _: "/usr/bin/gh")
+    monkeypatch.setattr(
+        "titan_agent.core.git.pr_engine.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "permission denied"),
+    )
+
+    result = engine.create_pull_request("Example change")
+
+    assert result.success is False
+    assert result.pr_url == ""
+    assert "Branch pushed to origin" in result.message
+    assert "creation failed" in result.message
+
+
+def test_missing_gh_does_not_return_fake_pr_url(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    engine = GitPREngine(workspace_root=repo)
+    _mock_push(monkeypatch, engine, repo)
+    monkeypatch.setattr("titan_agent.core.git.pr_engine.shutil.which", lambda _: None)
+
+    result = engine.create_pull_request("Example change")
+
+    assert result.success is False
+    assert result.pr_url == ""
+    assert "no Pull Request was created" in result.message

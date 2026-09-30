@@ -35,6 +35,8 @@ _PROTECTED_SAMPLES = [
     ("POST", "/api/queue/tasks"),
     ("GET", "/api/cron/jobs"),
     ("POST", "/api/chat/stream"),
+    ("GET", "/api/mcp/tools"),
+    ("GET", "/api/traces/recent"),
 ]
 
 
@@ -61,6 +63,16 @@ def test_health_public(client: TestClient) -> None:
     res = client.get("/health")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+def test_mcp_status_lists_configured_servers_even_when_offline(client: TestClient) -> None:
+    res = client.get("/api/mcp/tools", headers=_auth_headers())
+    assert res.status_code == 200
+    data = res.json()
+    assert "servers" in data
+    assert "configured_count" in data
+    assert "connected_count" in data
+    assert isinstance(data["servers"], dict)
 
 
 def test_root_public_shell(client: TestClient) -> None:

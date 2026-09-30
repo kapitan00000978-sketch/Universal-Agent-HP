@@ -32,7 +32,11 @@ class DeepSearchEngine:
                             "url": r.get("href", ""),
                             "snippet": r.get("body", "")
                         })
-            except (RuntimeError, OSError) as e:
+            except Exception as e:
+                # Search backends raise provider-specific exceptions (not just
+                # OSError/RuntimeError) for timeouts, rate limits and offline
+                # networks. Treat an unavailable source as an empty result so
+                # one failed backend does not abort the entire research task.
                 log = logging.getLogger(__name__)
                 log.debug("DDGS search failed for %s: %s", query, e)
             return results

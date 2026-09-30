@@ -23,6 +23,36 @@ async def test_tool_registry_mcp_presets(tmp_path):
     )
     assert "Successfully configured and saved MCP preset 'pg_test'" in res
     assert (tmp_path / "mcp_servers.json").exists()
+    # Standalone registries can only save a credential-free template; they
+    # must not claim a live connection when no MCP manager is attached.
+    assert "not connected" in res
+    assert "postgresql://localhost:5432/test" not in (tmp_path / "mcp_servers.json").read_text()
+
+
+@pytest.mark.asyncio
+async def test_agent_wires_preset_connect_to_live_mcp_manager(tmp_path):
+    class FakeMCPManager:
+        def __init__(self):
+            self.calls = []
+
+        async def connect_preset(self, **kwargs):
+            self.calls.append(kwargs)
+            return True, "connected in test"
+
+    manager = FakeMCPManager()
+    registry = ToolRegistry(workspace=tmp_path)
+    _agent = TitanAgent(tools=registry, mcp=manager)
+
+    result = await registry.tool_mcp_connect_preset(
+        preset_id="postgres",
+        server_name="pg_live",
+        env_overrides={"POSTGRES_URL": "{POSTGRES_URL}"},
+    )
+
+    assert result == "connected in test"
+    assert manager.calls[0]["preset_id"] == "postgres"
+    assert manager.calls[0]["server_name"] == "pg_live"
+    assert manager.calls[0]["env_overrides"] == {"POSTGRES_URL": "{POSTGRES_URL}"}
 
 
 @pytest.mark.asyncio

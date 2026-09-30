@@ -372,6 +372,102 @@ def test_download_refuses_private_target():
     assert "refused" in res
 
 
+def test_public_download_uses_validated_resolution_and_atomic_destination(tmp_path, monkeypatch):
+    import socket
+    import aiohttp
+
+    from titan_agent.tools import ToolRegistry
+
+    registry = ToolRegistry(tmp_path)
+    resolutions = []
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+
+        async def fake_getaddrinfo(host, port, **kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+        monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+
+        class FakeConnector:
+            def __init__(self, resolver, **_kwargs):
+                self.resolver = resolver
+
+        class FakeContent:
+            async def iter_chunked(self, _size):
+                yield b"validated-public-content"
+
+        connector_ref = {}
+
+        class FakeResponse:
+            content = FakeContent()
+
+            def raise_for_status(self):
+                return None
+
+        class FakeRequestContext:
+            async def __aenter__(self):
+                addresses = await connector_ref["connector"].resolver.resolve(
+                    "public-looking.example", 80, family=socket.AF_INET
+                )
+                resolutions.extend(addresses)
+                return FakeResponse()
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class FakeSession:
+            def __init__(self, connector, **_kwargs):
+                connector_ref["connector"] = connector
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def get(self, *_args, **_kwargs):
+                return FakeRequestContext()
+
+        monkeypatch.setattr(aiohttp, "TCPConnector", FakeConnector)
+        monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
+        return await registry.tool_download_file(
+            "http://public-looking.example/file.bin?token=do-not-echo"
+        )
+
+    result = asyncio.run(_run())
+    assert "Downloaded" in result
+    assert "do-not-echo" not in result
+    assert (tmp_path / "file.bin").read_bytes() == b"validated-public-content"
+    assert resolutions[0]["host"] == "93.184.216.34"
+    assert resolutions[0]["flags"] == socket.AI_NUMERICHOST
+
+
+def test_download_refuses_hostname_resolving_to_private_address(tmp_path, monkeypatch):
+    import socket
+
+    from titan_agent.tools import ToolRegistry
+
+    registry = ToolRegistry(tmp_path)
+    observed_hosts = []
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+
+        async def fake_getaddrinfo(host, port, **kwargs):
+            observed_hosts.append(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+        monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+        return await registry.tool_download_file("http://public-looking.example/secret.bin")
+
+    result = asyncio.run(_run())
+    assert observed_hosts == ["public-looking.example"]
+    assert "failed" in result.lower()
+    assert not (tmp_path / "secret.bin").exists()
+    assert not list(tmp_path.glob(".titan-download-*"))
+
+
 def test_download_refuses_bad_scheme():
     from titan_agent.tools import ToolRegistry
 

@@ -31,6 +31,8 @@ from titan_agent.core.tools.registry import ToolRegistry as GuardedToolRegistry
 from titan_agent.llm_client import LLMClient
 from titan_agent.server import app  # (must import after env setup)
 from titan_agent.structured import ToolBridge
+from titan_agent.checkpoint import CheckpointStore, RunCheckpoint
+import titan_agent.server as server_module
 
 
 @pytest.fixture()
@@ -233,13 +235,42 @@ def test_agent_gate_denied_blocks_execution() -> None:
     assert asyncio.run(scenario()) is False
 
 
-def test_agent_without_hitl_keeps_permissive_behavior() -> None:
-    hitl = HumanInTheLoop()
+def test_agent_without_hitl_fails_closed_for_approval_required_tools(monkeypatch) -> None:
+    import titan_agent.config as config
+
+    monkeypatch.setattr(config, "_FULL_ACCESS_OVERRIDE", False)
     agent = TitanAgent(llm=LLMClient(), hitl=None, hitl_timeout=2.0)
-    # A tool call with no HITL wired creates no approval requests at all.
-    assert not hitl.pending()
-    assert asyncio.run(agent._approval_gate("delete_file", {"path": "C:/z.txt"})) is None
-    # (standalone gate is a no-op guard; execute_tool_unified skips it entirely)
+    calls = []
+
+    async def execute_tool(name, args):
+        calls.append((name, args))
+        return "deleted"
+
+    monkeypatch.setattr(agent.tools, "execute_tool", execute_tool)
+    result = asyncio.run(agent.execute_tool_unified("delete_file", {"path": "C:/z.txt"}))
+    assert result.startswith("Error: approval required")
+    assert calls == []
+
+
+def test_agent_approval_gate_exception_fails_closed(monkeypatch) -> None:
+    import titan_agent.config as config
+
+    class BrokenHITL:
+        def request(self, *args, **kwargs):
+            raise RuntimeError("approval service unavailable")
+
+    monkeypatch.setattr(config, "_FULL_ACCESS_OVERRIDE", False)
+    agent = TitanAgent(llm=LLMClient(), hitl=BrokenHITL(), hitl_timeout=2.0)
+    calls = []
+
+    async def execute_tool(name, args):
+        calls.append((name, args))
+        return "deleted"
+
+    monkeypatch.setattr(agent.tools, "execute_tool", execute_tool)
+    result = asyncio.run(agent.execute_tool_unified("delete_file", {"path": "C:/z.txt"}))
+    assert result.startswith("Error: approval required")
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +367,44 @@ def test_tool_bridge_default_still_denies_without_responder() -> None:
     bridge = ToolBridge(execute, lambda: [_SIMPLE_TOOL_DEF], policy_engine=policy, hitl=None)
     result = asyncio.run(bridge.execute("delete_file", {"path": "C:/x.txt"}))
     assert "approval required" in result
+
+
+def test_checkpoint_reconciliation_endpoint_is_authenticated_and_does_not_replay(tmp_path, monkeypatch):
+    store = CheckpointStore(tmp_path / "reconcile.db")
+    store.save(
+        RunCheckpoint(
+            session_id="api-reconcile",
+            user_input="send message",
+            messages=[{"role": "assistant", "tool_calls": [
+                {"id": "m1", "function": {"name": "telegram_send", "arguments": "{}"}}
+            ]}],
+            status="tool_in_progress",
+        )
+    )
+    monkeypatch.setattr(server_module.agent, "_checkpoint", store)
+    monkeypatch.setattr(server_module.agent, "_checkpoint_loaded", True)
+
+    unauthorized = TestClient(app).post(
+        "/api/checkpoints/api-reconcile/reconcile",
+        json={"operator": "tester", "outcomes": {"m1": "sent"}},
+    )
+    assert unauthorized.status_code == 401
+
+    incomplete = TestClient(app).post(
+        "/api/checkpoints/api-reconcile/reconcile",
+        json={"operator": "tester", "outcomes": {}},
+        headers=auth(),
+    )
+    assert incomplete.status_code in {409, 422}
+
+    response = TestClient(app).post(
+        "/api/checkpoints/api-reconcile/reconcile",
+        json={"operator": "tester", "outcomes": {"m1": "delivery receipt verified"}},
+        headers=auth(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["checkpoint_status"] == "running"
+    assert store.load("api-reconcile").status == "running"
 
 
 _SIMPLE_TOOL_DEF = {

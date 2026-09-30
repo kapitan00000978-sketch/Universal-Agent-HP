@@ -14,10 +14,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System tools the agent relies on (git for gitops/self_update, certs for TLS)
+# System tools for GitOps, TLS, and stdio MCP servers (npx / uvx).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
+        nodejs \
+        npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer of stability: install deps before copying source so rebuilds are fast

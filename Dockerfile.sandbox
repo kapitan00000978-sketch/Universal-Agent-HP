@@ -1,0 +1,22 @@
+# Local execution image for agent-generated commands and tests.
+# Build once on the host: docker build -f Dockerfile.sandbox -t titan-agent-sandbox:local .
+# Runtime containers are started with no network, a read-only root filesystem,
+# dropped capabilities, no-new-privileges, resource limits, and only the intended
+# workspace mounted read/write.
+FROM python:3.12-slim
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir \
+        pytest pytest-asyncio pytest-mock \
+        aiohttp aiofiles ddgs requests python-dotenv \
+        fastapi pydantic pydantic-settings httpx2 \
+        playwright rich textual
+
+WORKDIR /workspace
+CMD ["python", "--version"]

@@ -1,17 +1,24 @@
 import asyncio
+import ipaddress
+import json
 import os
 import platform
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 import shlex
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     from ddgs import DDGS
@@ -20,6 +27,110 @@ except ImportError:
 from . import config as _cfg
 from .config import TASK_QUEUE_FILE, WORKSPACE_DIR
 from .core.guardrails.policy import PolicyEngine
+
+
+async def _terminate_process(proc: Any, *, process_group: bool = False) -> None:
+    """Terminate a subprocess (and optionally its POSIX process group)."""
+    try:
+        if process_group and os.name == "posix" and getattr(proc, "pid", None):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            killed = proc.kill()
+            if asyncio.iscoroutine(killed):
+                await killed
+    except ProcessLookupError:
+        pass
+    waited = proc.wait()
+    if asyncio.iscoroutine(waited):
+        await waited
+
+
+MAX_CAPTURE_BYTES_PER_STREAM = 64 * 1024
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+FULL_ACCESS_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+
+async def _read_bounded(stream: Any, limit: int, overflow: asyncio.Event) -> tuple[bytes, bool]:
+    """Read a subprocess pipe without buffering unbounded command output."""
+    captured = bytearray()
+    truncated = False
+    while True:
+        chunk = await stream.read(min(65536, limit - len(captured) + 1))
+        if not chunk:
+            break
+        remaining = limit - len(captured)
+        if len(chunk) > remaining:
+            captured.extend(chunk[:remaining])
+            truncated = True
+            overflow.set()
+            break
+        captured.extend(chunk)
+    return bytes(captured), truncated
+
+
+async def _bounded_communicate(
+    proc: Any,
+    timeout: float,
+    limit: int = MAX_CAPTURE_BYTES_PER_STREAM,
+    *,
+    process_group: bool = False,
+) -> tuple[bytes, bytes, bool, bool]:
+    """Collect stdout/stderr with a memory cap and stop timed-out/noisy processes.
+
+    Returns ``stdout, stderr, timed_out, output_truncated``. Cancellation kills
+    the direct subprocess and drains readers before propagating to the caller.
+    """
+    if proc.stdout is None or proc.stderr is None:
+        raise RuntimeError("subprocess output pipes are required")
+    overflow = asyncio.Event()
+    stdout_task = asyncio.create_task(_read_bounded(proc.stdout, limit, overflow))
+    stderr_task = asyncio.create_task(_read_bounded(proc.stderr, limit, overflow))
+    wait_task = asyncio.create_task(proc.wait())
+    overflow_task = asyncio.create_task(overflow.wait())
+    timed_out = False
+    try:
+        done, _pending = await asyncio.wait(
+            {wait_task, overflow_task},
+            timeout=max(0.1, float(timeout)),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            timed_out = True
+            await _terminate_process(proc, process_group=process_group)
+        elif overflow_task in done and overflow.is_set() and not wait_task.done():
+            await _terminate_process(proc, process_group=process_group)
+        if not wait_task.done():
+            await wait_task
+        stdout_result, stderr_result = await asyncio.gather(stdout_task, stderr_task)
+        truncated = stdout_result[1] or stderr_result[1]
+        return stdout_result[0], stderr_result[0], timed_out, truncated
+    except asyncio.CancelledError:
+        await _terminate_process(proc, process_group=process_group)
+        await asyncio.gather(stdout_task, stderr_task, wait_task, return_exceptions=True)
+        raise
+    except Exception:
+        await _terminate_process(proc, process_group=process_group)
+        await asyncio.gather(stdout_task, stderr_task, wait_task, return_exceptions=True)
+        raise
+    finally:
+        overflow_task.cancel()
+        await asyncio.gather(overflow_task, return_exceptions=True)
+
+
+async def _best_effort_docker_rm(docker_bin: str, container_name: str) -> None:
+    """Force-remove a timed-out/cancelled container without retaining output."""
+    try:
+        cleanup = await asyncio.create_subprocess_exec(
+            docker_bin, "rm", "-f", container_name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(cleanup.communicate(), timeout=5.0)
+        except asyncio.TimeoutError:
+            await _terminate_process(cleanup)
+    except (OSError, RuntimeError, ProcessLookupError):
+        pass
 
 
 def _command_timeout(base: float) -> float:
@@ -185,6 +296,11 @@ class ToolRegistry:
         # here we only accept the wiring to keep construction uniform.
         self.hitl = None
         self.hitl_timeout = 120.0
+        self.mcp_manager = None
+
+    def attach_mcp_manager(self, mcp_manager) -> None:
+        """Wire this registry to the agent's live MCP manager."""
+        self.mcp_manager = mcp_manager
 
     def attach_hitl(self, hitl, hitl_timeout: float | None = None) -> None:
         """Accept the global HITL manager (approvals enforced at the agent layer)."""
@@ -193,9 +309,24 @@ class ToolRegistry:
             self.hitl_timeout = hitl_timeout
 
     def _resolve_path(self, rel_or_abs: str | Path) -> Path:
+        """Resolve a tool path and keep ordinary access inside the workspace.
+
+        FULL_ACCESS is an explicit trust-mode bypass. Resolving symlinks before
+        the containment check prevents a workspace symlink from escaping the
+        boundary for file tools.
+        """
         p = Path(rel_or_abs)
         if not p.is_absolute():
-            p = (self.workspace / p).resolve()
+            p = self.workspace / p
+        p = p.resolve()
+        if not _cfg.full_access_enabled():
+            root = self.workspace.resolve()
+            try:
+                p.relative_to(root)
+            except ValueError as exc:
+                raise PermissionError(
+                    f"Path is outside the configured workspace: {p}"
+                ) from exc
         return p
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
@@ -204,7 +335,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "execute_command",
-                    "description": "Executes a PowerShell or shell command in the operating system and returns stdout and stderr.",
+                    "description": "Executes a shell command in a resource-limited Docker container by default, with network disabled and the configured workspace mounted. It fails closed if Docker is unavailable. Explicit TITAN_FULL_ACCESS bypasses container isolation and runs on the host.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -233,6 +364,20 @@ class ToolRegistry:
                                 "type": "string",
                                 "description": "Path to the file to read."
                             }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "analyze_python_file",
+                    "description": "Read and statically explain a Python file in the workspace: module purpose, imports, classes/functions, signatures, control flow, and internal calls. Uses AST parsing only; it never imports or executes the file. Use before changing unfamiliar Python code. Static summaries can miss dynamic runtime behavior.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Workspace-relative Python source file path."}
                         },
                         "required": ["path"]
                     }
@@ -373,6 +518,37 @@ class ToolRegistry:
                             }
                         },
                         "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "analyze_python_repository",
+                    "description": "Build a bounded, non-executing map of Python modules, definitions, syntax errors, and local import dependencies in the current workspace. Use early on unfamiliar repositories to understand structure and change impact. Static analysis only; dynamic imports and runtime behavior are not covered.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "max_files": {"type": "integer", "description": "Maximum Python modules to inspect (default 50, range 1-100)."}
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "laya_decide",
+                    "description": "API-key-free LOCAL structured inference using Laya or Laya-MLX. Accepts one state and typed choice/score/noul questions; returns structured decisions, not free-form text or code. Requires the optional runtime package and downloads model weights on first use. Laya-MLX requires Apple Silicon macOS.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "state": {"type": "string", "description": "Text state/document to evaluate."},
+                            "questions": {"type": "object", "description": "Laya typed questions: choice, score, or noul (yes/no probability)."},
+                            "backend": {"type": "string", "enum": ["auto", "laya", "laya-mlx"], "description": "Auto-select MLX on supported Apple Silicon if installed; otherwise upstream Laya."},
+                            "model": {"type": "string", "description": "Optional Laya checkpoint ID; primarily for laya-mlx."
+                            }
+                        },
+                        "required": ["state", "questions"]
                     }
                 }
             },
@@ -1338,7 +1514,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "self_improve_eval_run",
-                    "description": "SELF-IMPROVEMENT (Genesis Level 10): Runs the automated regression eval benchmark suite, reporting pass rates, scores, and regressions.",
+                    "description": "EVALUATION: Runs registered evaluation cases only when an explicit evaluation runner is configured. Without a runner, reports NOT RUN and never invents pass rates.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1379,7 +1555,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "docker_sandbox_run",
-                    "description": "Runs code or shell commands inside an isolated, disposable Docker container with resource limits and optional workspace mounting.",
+                    "description": "Runs code or shell commands in a hardened disposable Docker container: no network by default, read-only container root, dropped capabilities, no-new-privileges, process/CPU/memory limits. Mounting the project workspace is opt-in.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1389,15 +1565,15 @@ class ToolRegistry:
                             },
                             "image": {
                                 "type": "string",
-                                "description": "Docker image to use (default: 'python:3.12-slim'). Options: python:3.12-slim, node:20-slim, alpine:latest, ubuntu:22.04."
+                                "description": "Locally available Docker image (no automatic pulls; default: 'titan-agent-sandbox:local'). Build or pull it on the host before use."
                             },
                             "memory_limit": {
                                 "type": "string",
-                                "description": "Memory limit for the container (e.g. '256m', '512m', '1g'). Default: '512m'."
+                                "description": "Memory limit from 64m to 4g (e.g. '256m', '512m', '1g'). Default: '512m'."
                             },
                             "cpu_quota": {
                                 "type": "string",
-                                "description": "CPU quota / max CPUs (e.g. '0.5', '1.0'). Default: '1.0'."
+                                "description": "CPU quota from 0.1 to 4.0 CPUs (e.g. '0.5', '1.0'). Default: '1.0'."
                             },
                             "mount_workspace": {
                                 "type": "boolean",
@@ -1405,7 +1581,7 @@ class ToolRegistry:
                             },
                             "network": {
                                 "type": "string",
-                                "description": "Container network mode ('none' for airgapped sandbox, 'bridge' for internet). Default: 'bridge'."
+                                "description": "Container network mode: 'none' (default) or explicitly enabled 'bridge'."
                             },
                             "timeout": {
                                 "type": "number",
@@ -1678,13 +1854,13 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "mcp_connect_preset",
-                    "description": "MCP INTEGRATION: Connects any ready industry-standard MCP server (postgres, github, slack, brave_search, filesystem, sqlite, puppeteer, gdrive) with a single call.",
+                    "description": "MCP INTEGRATION: Connects a preset (postgres, github, slack, brave_search, filesystem, sqlite, puppeteer, gdrive). Never pass credential literals; store secrets in process environment and pass {ENV_VAR} references.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "preset_id": {"type": "string", "description": "Preset identifier: postgres, github, slack, brave_search, filesystem, sqlite, puppeteer, gdrive."},
                             "server_name": {"type": "string", "description": "Optional custom name for the connection (default: same as preset_id)."},
-                            "env_overrides": {"type": "object", "description": "Environment variables required (e.g. POSTGRES_URL, GITHUB_PERSONAL_ACCESS_TOKEN, BRAVE_API_KEY)."}
+                            "env_overrides": {"type": "object", "description": "Optional field-to-environment-reference mapping; never include secret values. Example: {\"POSTGRES_URL\": \"{POSTGRES_URL}\"}. The referenced variables must already exist in the process environment."}
                         },
                         "required": ["preset_id"]
                     }
@@ -2090,22 +2266,99 @@ class ToolRegistry:
         from titan_agent.llm_client import LLMClient
         llm = LLMClient()
         
-        runner = None
-        if shutil.which("docker"):
-            async def _docker_runner(script: str) -> str:
-                return await self.tool_docker_sandbox_run(
-                    command=f"python -c {shlex.quote(script)}",
-                    image="python:3.11-slim",
-                    timeout=60.0,
-                )
-            runner = _docker_runner
-            
-        verifier = DeepVerifier(llm, sandbox_runner=runner)
+        async def _docker_runner(script: str) -> str:
+            raw = await self.tool_docker_sandbox_run(
+                command=script,
+                image=os.getenv("TITAN_COMMAND_SANDBOX_IMAGE", "titan-agent-sandbox:local"),
+                timeout=60.0,
+                network="none",
+            )
+            header = re.search(r"\(Exit (-?\d+)\)", raw)
+            if not header:
+                return json.dumps({"exit_code": -1, "stdout": "", "stderr": raw})
+            exit_code = int(header.group(1))
+            body = raw[header.end():].lstrip("\n")
+            stdout = body.split("STDOUT:\n", 1)[1].split("\nSTDERR:\n", 1)[0] if "STDOUT:\n" in body else ""
+            stderr = body.split("\nSTDERR:\n", 1)[1] if "\nSTDERR:\n" in body else ""
+            return json.dumps({"exit_code": exit_code, "stdout": stdout, "stderr": stderr})
+
+        verifier = DeepVerifier(llm, sandbox_runner=_docker_runner)
         result = await verifier.self_heal_loop(code, intent, max_iterations=3)
         if result["verified"]:
             return f"Deep Verify SUCCEEDED! Verified Code:\n{result['code']}\n\nFinal Output:\n{result['final_output']}"
         else:
             return f"Deep Verify FAILED after {result['iterations']} iterations.\nLast Output:\n{result['final_output']}\nLast Code:\n{result['code']}"
+
+    async def _run_dynamic_tool_container(
+        self,
+        name: str,
+        python_code: str,
+        arguments: dict[str, Any],
+        timeout: float,
+    ) -> str:
+        """Invoke a generated tool in a fresh, network-disabled Docker container."""
+        import base64
+        import uuid
+
+        try:
+            arguments_json = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return "Error: dynamic tool arguments must be JSON-serializable."
+        if len(arguments_json.encode("utf-8")) > 64 * 1024:
+            return "Error: dynamic tool arguments exceed the 64 KiB sandbox limit."
+        if len(python_code.encode("utf-8")) > 128 * 1024:
+            return "Error: generated tool source exceeds the 128 KiB sandbox limit."
+
+        marker = f"__TITAN_DYNAMIC_RESULT_{uuid.uuid4().hex}__:"
+        runner_script = "\n".join((
+            "import asyncio, base64, inspect, json, os, sys",
+            "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))",
+            "import synthesized_module",
+            f"tool_name = {name!r}",
+            "with open('/workspace/arguments.json', encoding='utf-8') as f: arguments = json.load(f)",
+            "try:",
+            "    fn = getattr(synthesized_module, tool_name, None) or getattr(synthesized_module, 'tool_' + tool_name, None)",
+            "    if fn is None: raise LookupError('declared entry point missing')",
+            "    value = fn(**arguments)",
+            "    if inspect.isawaitable(value): value = asyncio.run(value)",
+            "    payload = {'ok': True, 'value': value}",
+            "except BaseException as exc:",
+            "    payload = {'ok': False, 'error': type(exc).__name__}",
+            f"print({marker!r} + base64.b64encode(json.dumps(payload, ensure_ascii=False, default=str).encode()).decode())",
+            "if not payload['ok']: raise SystemExit(1)",
+            "",
+        ))
+
+        with tempfile.TemporaryDirectory(prefix="titan_dynamic_call_") as tmpdir:
+            root = Path(tmpdir)
+            (root / "synthesized_module.py").write_text(python_code, encoding="utf-8")
+            (root / "arguments.json").write_text(arguments_json, encoding="utf-8")
+            (root / "run_dynamic_tool.py").write_text(runner_script, encoding="utf-8")
+            raw = await self.tool_docker_sandbox_run(
+                command="python -I -s /workspace/run_dynamic_tool.py",
+                image=os.getenv("TITAN_COMMAND_SANDBOX_IMAGE", "titan-agent-sandbox:local"),
+                timeout=max(0.5, min(float(timeout), 30.0)),
+                network="none",
+                _mount_path=root,
+            )
+        match = re.search(r"\(Exit (-?\d+)\)", raw)
+        if not match or int(match.group(1)) != 0:
+            return "Error: isolated dynamic tool failed or was truncated; result not accepted."
+        encoded = None
+        for line in raw.splitlines():
+            if marker in line:
+                encoded = line.split(marker, 1)[1].strip()
+        if not encoded:
+            return "Error: isolated dynamic tool returned no valid result."
+        try:
+            payload = json.loads(base64.b64decode(encoded, validate=True))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return "Error: isolated dynamic tool returned malformed output."
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            error_type = payload.get("error", "RuntimeError") if isinstance(payload, dict) else "RuntimeError"
+            return f"Error: isolated dynamic tool raised {error_type}."
+        value = payload.get("value")
+        return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
 
     async def tool_synthesize_tool(
         self,
@@ -2115,11 +2368,42 @@ class ToolRegistry:
         test_code: str = "",
         parameters: dict[str, Any] | None = None,
     ) -> str:
-        """Autonomously synthesizes, sandbox-tests, and registers a brand new tool into the live session."""
+        """Synthesize a tool whose verification and invocation run in Docker."""
+        if os.getenv("TITAN_DYNAMIC_TOOLS_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+            return (
+                "Error: dynamic Python tool synthesis is disabled. Set "
+                "TITAN_DYNAMIC_TOOLS_ENABLED=true only in a trusted environment; "
+                "Docker is required for both verification and each invocation."
+            )
         from titan_agent.core.synthesis.dynamic_tool_synthesizer import DynamicToolSynthesizer
         synthesizer = getattr(self, "_tool_synthesizer", None)
         if synthesizer is None:
-            synthesizer = DynamicToolSynthesizer(self.workspace)
+            async def _dynamic_sandbox_runner(temp_workspace: Path, timeout: float):
+                raw = await self.tool_docker_sandbox_run(
+                    command="python -E -s /workspace/test_synthesized.py",
+                    image=os.getenv("TITAN_COMMAND_SANDBOX_IMAGE", "titan-agent-sandbox:local"),
+                    timeout=timeout,
+                    network="none",
+                    _mount_path=temp_workspace,
+                )
+                match = re.search(r"\(Exit (-?\d+)\)", raw)
+                passed = bool(
+                    match
+                    and int(match.group(1)) == 0
+                    and "___SYNTHESIS_TEST_PASSED___" in raw
+                )
+                return passed, raw
+
+            async def _dynamic_runtime_runner(name, python_code, arguments, timeout):
+                return await self._run_dynamic_tool_container(
+                    name, python_code, arguments, timeout
+                )
+
+            synthesizer = DynamicToolSynthesizer(
+                self.workspace,
+                sandbox_runner=_dynamic_sandbox_runner,
+                runtime_runner=_dynamic_runtime_runner,
+            )
             self._tool_synthesizer = synthesizer
 
         params = parameters or {"type": "object", "properties": {}}
@@ -2148,7 +2432,43 @@ class ToolRegistry:
     ) -> str:
         """Executes a full autonomous Red-Green-Refactor software cycle in an isolated sandbox."""
         from titan_agent.core.code_intel.tdd_engine import AutonomousTDDEngine
-        engine = AutonomousTDDEngine(self.workspace)
+
+        async def _sandbox_pytest(test_path: Path, temp_workspace: Path, timeout: float):
+            started = time.monotonic()
+            if _cfg.full_access_enabled():
+                # Explicit trusted-mode bypass. This subprocess inherits host
+                # privileges and is deliberately not described as a sandbox.
+                spawn_options: dict[str, Any] = {}
+                if os.name == "posix":
+                    spawn_options["start_new_session"] = True
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "pytest", str(test_path), "-v", "-s",
+                    cwd=str(temp_workspace),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    **spawn_options,
+                )
+                stdout, stderr, timed_out, truncated = await _bounded_communicate(
+                    proc, timeout, process_group=(os.name == "posix")
+                )
+                if timed_out:
+                    return 124, "Trusted host test timed out.", time.monotonic() - started
+                output = stdout.decode(errors="replace") + stderr.decode(errors="replace")
+                if truncated:
+                    output += f"\\n[Output truncated at {MAX_CAPTURE_BYTES_PER_STREAM} bytes per stream]"
+                return (126 if truncated else proc.returncode or 0), output, time.monotonic() - started
+            command = f"python -E -s -m pytest /workspace/{test_path.name} -v -s"
+            raw = await self.tool_docker_sandbox_run(
+                command=command,
+                image=os.getenv("TITAN_COMMAND_SANDBOX_IMAGE", "titan-agent-sandbox:local"),
+                timeout=timeout,
+                network="none",
+                _mount_path=temp_workspace,
+            )
+            match = re.search(r"\(Exit (-?\d+)\)", raw)
+            return (int(match.group(1)) if match else 126, raw, time.monotonic() - started)
+
+        engine = AutonomousTDDEngine(self.workspace, sandbox_runner=_sandbox_pytest)
         report = await engine.execute_tdd_cycle(
             test_code=test_code,
             implementation_code=implementation_code,
@@ -2196,13 +2516,30 @@ class ToolRegistry:
     ) -> str:
         """Connects any ready MCP server preset in a single call."""
         from titan_agent.core.mcp.presets import MCPPresetManager
+        name = server_name or preset_id
+        if self.mcp_manager is not None:
+            ok, message = await self.mcp_manager.connect_preset(
+                preset_id=preset_id,
+                server_name=name,
+                env_overrides=env_overrides,
+                workspace_dir=self.workspace,
+            )
+            return message if ok else f"Error: {message}"
+
+        # A standalone ToolRegistry has no live manager to attach the process
+        # to. Save only the preset template (never inline credential values) and
+        # make the non-connected state explicit instead of claiming success.
         mgr = MCPPresetManager(self.workspace / "mcp_servers.json")
-        cfg, err = mgr.generate_server_config(preset_id, env_overrides)
+        cfg, err = mgr.generate_server_config(preset_id)
         if not cfg:
             return f"Error: {err}"
-        name = server_name or preset_id
-        mgr.save_server_to_config(name, cfg)
-        return f"Successfully configured and saved MCP preset '{name}'. Reconnecting MCP servers..."
+        if not mgr.save_server_to_config(name, cfg):
+            return f"Error: failed to save MCP preset '{name}'."
+        return (
+            f"Successfully configured and saved MCP preset '{name}', but it is not connected "
+            "because this ToolRegistry has no live MCP manager. Configure required environment "
+            "variables and connect it through an agent session."
+        )
 
     def tool_mcp_list_presets(self) -> str:
         """Lists available 1-line MCP presets."""
@@ -2303,33 +2640,130 @@ class ToolRegistry:
         ep = replay.record_experience(error_text, resolution, diagnosis)
         return f"Successfully recorded experience episode #{ep.id} (`{ep.fingerprint}`) in episodic memory."
 
-    async def tool_execute_command(self, command: str, cwd: str = "") -> str:
-        working_dir = self._resolve_path(cwd) if cwd else self.workspace
-        working_dir.mkdir(parents=True, exist_ok=True)
+    async def tool_execute_command(
+        self,
+        command: str,
+        cwd: str = "",
+        _timeout_override: float | None = None,
+    ) -> str:
+        """Run commands in an isolated Docker container by default.
+
+        The host-process route is available only through explicit FULL_ACCESS.
+        Missing Docker never causes a silent fallback to host execution.
+        """
+        if not command or not str(command).strip():
+            return "Error: command is required."
         timeout = _command_timeout(45.0)
+        if _timeout_override is not None:
+            timeout = min(timeout, max(0.5, float(_timeout_override)))
+        if _cfg.full_access_enabled():
+            return await self._tool_execute_command_host(command, cwd, timeout)
+
+        docker_bin = shutil.which("docker")
+        if not docker_bin:
+            return (
+                "Error: isolated command execution requires Docker, but Docker was not found. "
+                "No host-shell fallback was attempted. Install Docker and build/pull the configured image locally, or explicitly "
+                "enable TITAN_FULL_ACCESS only in a trusted environment."
+            )
+
         try:
-            # Use powershell on windows
-            shell_cmd = ["powershell", "-NoProfile", "-Command", command] if sys.platform == "win32" else ["bash", "-c", command]
+            workspace = self.workspace.resolve()
+            working_dir = self._resolve_path(cwd) if cwd else workspace
+            relative_cwd = working_dir.relative_to(workspace).as_posix()
+        except (OSError, ValueError, PermissionError) as exc:
+            return f"Error: command working directory must be inside the workspace: {exc}"
+
+        image = os.getenv("TITAN_COMMAND_SANDBOX_IMAGE", "titan-agent-sandbox:local").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9./:_@-]{0,254}", image):
+            return "Error: TITAN_COMMAND_SANDBOX_IMAGE is not a valid Docker image reference."
+        container_cwd = "/workspace" if relative_cwd in ("", ".") else f"/workspace/{relative_cwd}"
+        container_name = f"titan-command-{uuid.uuid4().hex}"
+        docker_cmd = [
+            docker_bin, "run", "--name", container_name, "--rm", "--pull=never",
+            "--network=none",
+            "--memory=512m", "--cpus=1.0", "--pids-limit=128",
+            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "--mount", f"type=bind,src={workspace},dst=/workspace,rw",
+            "--workdir", container_cwd,
+        ]
+        if hasattr(os, "getuid") and hasattr(os, "getgid"):
+            docker_cmd.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        docker_cmd.extend([image, "sh", "-lc", str(command)])
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *docker_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr, timed_out, truncated = await _bounded_communicate(proc, timeout)
+            if timed_out:
+                await _best_effort_docker_rm(docker_bin, container_name)
+                return f"Error: sandboxed command timed out after {timeout:.0f} seconds."
+            if truncated:
+                await _best_effort_docker_rm(docker_bin, container_name)
+            out_str = stdout.decode("utf-8", errors="replace").strip()
+            err_str = stderr.decode("utf-8", errors="replace").strip()
+            exit_code = 125 if truncated and proc.returncode == 0 else proc.returncode
+            result = [f"### DOCKER COMMAND SANDBOX (Exit {exit_code})"]
+            if out_str:
+                result.append(f"STDOUT:\n{out_str}")
+            if err_str:
+                result.append(f"STDERR:\n{err_str}")
+            if truncated:
+                result.append(f"[Output truncated at {MAX_CAPTURE_BYTES_PER_STREAM} bytes per stream; process stopped]")
+            if not out_str and not err_str:
+                result.append("(No output produced)")
+            return "\n".join(result)
+        except asyncio.CancelledError:
+            await _best_effort_docker_rm(docker_bin, container_name)
+            raise
+        except (OSError, RuntimeError) as exc:
+            return f"Error: sandboxed command could not start: {exc!s}"
+
+    async def _tool_execute_command_host(
+        self, command: str, cwd: str, timeout: float
+    ) -> str:
+        """Explicit FULL_ACCESS host-shell path; never selected as fallback."""
+        working_dir = Path(cwd).resolve() if cwd else self.workspace.resolve()
+        try:
+            shell_cmd = (
+                ["powershell", "-NoProfile", "-Command", command]
+                if sys.platform == "win32"
+                else ["bash", "-c", command]
+            )
+            spawn_options: dict[str, Any] = {}
+            if os.name == "posix":
+                spawn_options["start_new_session"] = True
             proc = await asyncio.create_subprocess_exec(
                 *shell_cmd,
                 cwd=str(working_dir),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                **spawn_options,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            out_str = stdout.decode('utf-8', errors='ignore')
-            err_str = stderr.decode('utf-8', errors='ignore')
-            res = []
+            stdout, stderr, timed_out, truncated = await _bounded_communicate(
+                proc, timeout, process_group=(os.name == "posix")
+            )
+            if timed_out:
+                return f"Error: host command timed out after {timeout:.0f} seconds."
+            out_str = stdout.decode("utf-8", errors="replace").strip()
+            err_str = stderr.decode("utf-8", errors="replace").strip()
+            exit_code = 125 if truncated and proc.returncode == 0 else proc.returncode
+            result = [f"### HOST COMMAND (Exit {exit_code})"]
             if out_str:
-                res.append(f"STDOUT:\n{out_str.strip()}")
+                result.append(f"STDOUT:\n{out_str}")
             if err_str:
-                res.append(f"STDERR:\n{err_str.strip()}")
-            res.append(f"Exit code: {proc.returncode}")
-            return "\n".join(res) if res else "Command executed with no output."
-        except asyncio.TimeoutError:
-            return f"Error: Command timed out after {timeout:.0f} seconds."
-        except (OSError, RuntimeError) as e:
-            return f"Command execution error: {e!s}"
+                result.append(f"STDERR:\n{err_str}")
+            if truncated:
+                result.append(f"[Output truncated at {MAX_CAPTURE_BYTES_PER_STREAM} bytes per stream; process stopped]")
+            return "\n".join(result)
+        except asyncio.CancelledError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            return f"Command execution error: {exc!s}"
 
     def tool_read_file(self, path: str) -> str:
         fpath = self._resolve_path(path)
@@ -2343,6 +2777,53 @@ class ToolRegistry:
             return content if content else "(File is empty)"
         except OSError as e:
             return f"Error reading file '{fpath}': {e!s}"
+
+    def tool_analyze_python_file(self, path: str) -> str:
+        """Read and explain Python structure using AST only; never execute source."""
+        try:
+            target = self._resolve_path(path)
+        except (OSError, PermissionError, ValueError) as exc:
+            return f"Error: cannot access source file: {exc!s}"
+        if target.suffix.lower() != ".py":
+            return "Error: analyze_python_file accepts Python (.py) files only."
+        if not target.is_file():
+            return f"Error: Python source file does not exist: {path}"
+        try:
+            from .core.code_intel.source_analyzer import analyze_python_source, format_analysis
+
+            size = target.stat().st_size
+            if size > 1_000_000:
+                return "Error: source file exceeds the 1000000-byte static-analysis limit."
+            source = target.read_text(encoding="utf-8")
+            return format_analysis(analyze_python_source(source, filename=Path(path).as_posix()))
+        except (OSError, UnicodeError, ValueError) as exc:
+            return f"Error: could not analyze Python source: {type(exc).__name__}: {exc!s}"
+
+    def tool_analyze_python_repository(self, max_files: int = 50) -> str:
+        """Summarize local Python modules/imports without executing project code."""
+        try:
+            from .core.code_intel.repo_analyzer import analyze_python_repository, format_repository_analysis
+
+            result = analyze_python_repository(self.workspace, max_files=max_files)
+            formatted = format_repository_analysis(result)
+            output_cap = 24_000
+            if len(formatted) > output_cap:
+                formatted = formatted[:output_cap] + "\n[Output truncated to keep repository analysis bounded.]"
+            return formatted
+        except (OSError, TypeError, ValueError) as exc:
+            return f"Error: could not analyze Python repository: {type(exc).__name__}: {exc!s}"
+
+    async def tool_laya_decide(
+        self,
+        state: str,
+        questions: dict[str, Any],
+        backend: str = "auto",
+        model: str = "",
+    ) -> str:
+        """Run local, API-key-free typed decisions; this is not a chat-model call."""
+        from .laya_decisions import predict_decisions
+
+        return await predict_decisions(state, questions, backend=backend, model=model)
 
     def tool_write_file(self, path: str, content: str) -> str:
         fpath = self._resolve_path(path)
@@ -2417,21 +2898,12 @@ class ToolRegistry:
             return f"Scraping error for {url}: {e!s}"
 
     async def tool_python_eval(self, code: str) -> str:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", code,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            res = []
-            if stdout:
-                res.append(f"STDOUT:\n{stdout.decode('utf-8', errors='ignore')}")
-            if stderr:
-                res.append(f"STDERR:\n{stderr.decode('utf-8', errors='ignore')}")
-            return "\n".join(res) if res else "(Code executed with no output)"
-        except (OSError, RuntimeError, asyncio.TimeoutError) as e:
-            return f"Python execution error: {e!s}"
+        """Execute Python using the same sandbox boundary as shell commands."""
+        if not code or not str(code).strip():
+            return "Error: Python code is required."
+        command = f"python -I -c {shlex.quote(str(code))}"
+        result = await self.tool_execute_command(command, cwd=".")
+        return f"### PYTHON SANDBOX RESULT\n{result}"
 
     async def tool_deep_search(self, topic: str) -> str:
         from .deep_search import DeepSearchEngine
@@ -3095,31 +3567,19 @@ class ToolRegistry:
         Used by self_heal so the repair loop can inspect raw output.
         Phase 8: FULL access raises the ceiling to 10 minutes.
         """
-        timeout = _command_timeout(timeout) if _cfg.full_access_enabled() else (timeout or 60.0)
-        working_dir = self._resolve_path(cwd) if cwd else self.workspace
-        working_dir.mkdir(parents=True, exist_ok=True)
-        shell_cmd = (
-            ["powershell", "-NoProfile", "-Command", command]
-            if sys.platform == "win32"
-            else ["bash", "-c", command]
+        result = await self.tool_execute_command(
+            command,
+            cwd=cwd,
+            _timeout_override=float(timeout or 60.0),
         )
-        proc = await asyncio.create_subprocess_exec(
-            *shell_cmd,
-            cwd=str(working_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return 1, "", f"Command timed out after {timeout:.0f}s."
-        return (
-            proc.returncode or 0,
-            stdout.decode("utf-8", errors="ignore"),
-            stderr.decode("utf-8", errors="ignore"),
-        )
+        match = re.search(r"\(Exit (-?\d+)\)", result)
+        if not match:
+            return 126, "", result
+        exit_code = int(match.group(1))
+        body = result[match.end():].lstrip("\n")
+        stdout = body.split("STDOUT:\n", 1)[1].split("\nSTDERR:\n", 1)[0] if "STDOUT:\n" in body else ""
+        stderr = body.split("\nSTDERR:\n", 1)[1] if "\nSTDERR:\n" in body else ""
+        return exit_code, stdout, stderr
 
     async def tool_self_heal(self, command: str, cwd: str = "", max_attempts: int = 3) -> str:
         """Self-healing command runner: run, diagnose failure, repair, re-run."""
@@ -3134,45 +3594,135 @@ class ToolRegistry:
         return result.to_text()
 
     async def tool_download_file(self, url: str, dest: str = "") -> str:
-        """SSRF-guarded download of a public http(s) URL into the workspace.
+        """Stream a bounded download into the workspace with DNS-level SSRF checks.
 
-        Phase 8: FULL access removes the 100 MB safety cap and raises the fetch
-        timeout to 2 minutes; ABSOLUTE access also skips the SSRF private-
-        network guard and allows any scheme urlopen supports.
+        Normal and FULL modes allow only public HTTP(S) addresses, including
+        redirect targets. ABSOLUTE mode intentionally bypasses that restriction.
+        Files are written to a same-directory temporary file and atomically
+        replaced only after a complete download within the configured limit.
         """
         url = (url or "").strip()
         absolute = _cfg.absolute_access_enabled()
-        if not absolute and not url.lower().startswith(("http://", "https://")):
-            return "Error: only http(s) URLs are allowed."
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return "Error: URL is malformed."
         if not absolute:
+            if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+                return "Error: only http(s) URLs with a valid hostname are allowed."
+            if parts.username is not None or parts.password is not None:
+                return "Error: URLs containing embedded credentials are not allowed."
+            try:
+                _ = parts.port  # Validate malformed and out-of-range ports.
+            except ValueError:
+                return "Error: URL contains an invalid port."
             policy = PolicyEngine()
             check = policy.check_network_target(url)
             if check.decision == "deny":
-                return f"Error: refused to download private/loopback target ({url})."
+                return "Error: refused to download a private or loopback target."
+
+        source_display = parts._replace(query="", fragment="").geturl()
         try:
-            target = self._resolve_path(dest) if dest else self.workspace
-            if dest and dest.lower().endswith("/"):
-                target.mkdir(parents=True, exist_ok=True)
-            elif not dest:
-                target = self.workspace
-            fname = Path(url.split("?")[0].split("#")[0]).name or "download.bin"
-            out_path = (target if target.is_dir() else self.workspace) / fname
+            fname = Path(parts.path).name or "download.bin"
+            if fname in {".", ".."}:
+                fname = "download.bin"
+            if dest:
+                target = self._resolve_path(dest)
+                if dest.endswith(("/", "\\")) or target.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    out_path = target / fname
+                else:
+                    out_path = target
+            else:
+                out_path = self._resolve_path(fname)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            req = urllib.request.Request(url, headers={"User-Agent": "Titan-Agent/8.0"})
             fetch_timeout = 120.0 if _cfg.full_access_enabled() else 30.0
-            max_bytes = 2 * 1024 * 1024 * 1024 if _cfg.full_access_enabled() else 100 * 1024 * 1024
+            max_bytes = FULL_ACCESS_MAX_DOWNLOAD_BYTES if _cfg.full_access_enabled() else MAX_DOWNLOAD_BYTES
+            fd, temp_name = tempfile.mkstemp(prefix=".titan-download-", dir=out_path.parent)
+            os.close(fd)
+            temp_path = Path(temp_name)
 
-            def _fetch() -> bytes:
-                with urllib.request.urlopen(req, timeout=fetch_timeout) as resp:
-                    return resp.read()
+            class _DownloadTooLarge(Exception):
+                pass
 
-            data = await asyncio.to_thread(_fetch)
-            if len(data) > max_bytes:
-                return f"Error: download exceeds {max_bytes // (1024 * 1024)} MB safety limit."
-            out_path.write_bytes(data)
-            return f"Downloaded {url}\nSaved: {out_path}\nSize: {len(data)} bytes"
-        except (OSError, ValueError, urllib.error.URLError) as e:
-            return f"Download failed: {e!s}"
+            async def _fetch_public() -> int:
+                import aiohttp
+
+                class _PublicOnlyResolver(aiohttp.abc.AbstractResolver):
+                    async def resolve(self, host, port=0, family=socket.AF_INET):
+                        loop = asyncio.get_running_loop()
+                        try:
+                            records = await loop.getaddrinfo(
+                                host, port, family=family, type=socket.SOCK_STREAM
+                            )
+                        except OSError as exc:
+                            raise OSError("DNS resolution failed") from exc
+                        addresses = []
+                        for af, _socktype, proto, _canonname, sockaddr in records:
+                            address = ipaddress.ip_address(sockaddr[0])
+                            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                                address = address.ipv4_mapped
+                            if not address.is_global:
+                                raise OSError("refused non-public DNS address")
+                            addresses.append({
+                                "hostname": host,
+                                "host": sockaddr[0],
+                                "port": port,
+                                "family": af,
+                                "proto": proto,
+                                "flags": socket.AI_NUMERICHOST,
+                            })
+                        if not addresses:
+                            raise OSError("DNS returned no usable addresses")
+                        return addresses
+
+                    async def close(self):
+                        return None
+
+                connector = aiohttp.TCPConnector(
+                    resolver=_PublicOnlyResolver(), use_dns_cache=False
+                )
+                timeout = aiohttp.ClientTimeout(total=fetch_timeout)
+                total = 0
+                async with aiohttp.ClientSession(
+                    connector=connector, timeout=timeout, trust_env=False
+                ) as session:
+                    async with session.get(url, allow_redirects=True, max_redirects=5) as response:
+                        response.raise_for_status()
+                        with temp_path.open("wb") as output:
+                            async for chunk in response.content.iter_chunked(64 * 1024):
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise _DownloadTooLarge
+                                output.write(chunk)
+                return total
+
+            def _fetch_absolute() -> int:
+                total = 0
+                req = urllib.request.Request(url, headers={"User-Agent": "Titan-Agent/8.0"})
+                with urllib.request.urlopen(req, timeout=fetch_timeout) as response, temp_path.open("wb") as output:
+                    while True:
+                        chunk = response.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise _DownloadTooLarge
+                        output.write(chunk)
+                return total
+
+            try:
+                size = await asyncio.to_thread(_fetch_absolute) if absolute else await _fetch_public()
+                os.replace(temp_path, out_path)
+                return f"Downloaded {source_display}\nSaved: {out_path}\nSize: {size} bytes"
+            except _DownloadTooLarge:
+                return f"Error: download exceeds the configured {max_bytes}-byte safety limit."
+            finally:
+                temp_path.unlink(missing_ok=True)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            return f"Download failed ({type(exc).__name__}); no partial file was installed."
+        except Exception as exc:  # noqa: BLE001 - sanitize third-party/network exception details
+            return f"Download failed ({type(exc).__name__}); no partial file was installed."
 
     def _start_server(self, port: int, directory: Path) -> str:
         """Start (or return existing) ThreadingHTTPServer on localhost:port."""
@@ -3662,35 +4212,64 @@ class ToolRegistry:
             f"- Status: {'SUCCESS' if report['success'] else 'FAILED'}"
         )
 
-    def tool_sandbox_execute(
+    async def tool_sandbox_execute(
         self,
         code: str,
         language: str = "python",
         timeout: float = 30.0,
         rollback_on_failure: bool = True,
     ) -> str:
-        """Safely executes code in the sandbox with timeout and optional auto-rollback."""
+        """Run Python inside the command Docker sandbox, optionally rolling back workspace edits.
+
+        The old subprocess runner only separated interpreter state; it did not
+        provide OS isolation. This tool now uses the default container path and
+        fails closed when Docker is unavailable (except explicit FULL_ACCESS).
+        """
         if not code or not str(code).strip():
             return "Error: code is required."
-        res = self.safe_runner.run(
-            code=code,
-            language=str(language or "python"),
-            timeout=float(timeout or 30.0),
-            auto_rollback=bool(rollback_on_failure),
+        if str(language or "python").lower().strip() != "python":
+            return "Error: only Python is supported by the isolated execution tool."
+        is_safe, reason = self.safe_runner.validate_code_safety(str(code))
+        if not is_safe:
+            return f"Error: execution blocked by the static safety check: {reason}"
+
+        snapshot_name = f"pre_python_exec_{time.time_ns()}"
+        snap_created = False
+        script_path = self._resolve_path(f".titan_python_exec_{time.time_ns()}.py")
+        try:
+            if rollback_on_failure:
+                snap_created = bool(self.sandbox_env.create_snapshot(snapshot_name))
+            script_path.write_text(str(code), encoding="utf-8")
+            if _cfg.full_access_enabled():
+                executable_path = shlex.quote(str(script_path))
+            else:
+                executable_path = "/workspace/" + script_path.relative_to(self.workspace.resolve()).as_posix()
+            command = f"python -I {executable_path}"
+            # Preserve the caller's timeout by temporarily running this tool's
+            # standard execution route under its normal bounded command timeout.
+            result = await self.tool_execute_command(
+                command,
+                cwd=".",
+                _timeout_override=float(timeout or 30.0),
+            )
+        except (OSError, RuntimeError, ValueError, PermissionError) as exc:
+            result = f"Error: isolated Python execution failed: {exc!s}"
+        finally:
+            script_path.unlink(missing_ok=True)
+
+        match = re.search(r"\(Exit (-?\d+)\)", result)
+        success = bool(match and int(match.group(1)) == 0)
+        rolled_back = False
+        if not success and rollback_on_failure and snap_created:
+            try:
+                rolled_back = bool(self.sandbox_env.rollback(snapshot_name).get("success"))
+            except Exception:  # noqa: BLE001 - execution error must remain visible
+                rolled_back = False
+        status = "PASSED" if success else "FAILED / NOT RUN"
+        return (
+            f"### SANDBOX EXECUTION RESULT (PYTHON | {status})\n"
+            f"- **Auto-Rolled Back**: {rolled_back}\n{result}"
         )
-        lines = [
-            f"### SANDBOX EXECUTION RESULT ({res.language.upper()} | Exit {res.exit_code}):",
-            f"- **Success**: {res.success}",
-            f"- **Execution Time**: {res.duration_sec:.2f}s",
-            f"- **Auto-Rolled Back**: {res.rolled_back}",
-        ]
-        if res.error:
-            lines.append(f"- **Error / Alert**: {res.error}")
-        if res.stdout:
-            lines.append(f"\nSTDOUT:\n{res.stdout}")
-        if res.stderr:
-            lines.append(f"\nSTDERR:\n{res.stderr}")
-        return "\n".join(lines)
 
     @property
     def drift_detector(self):
@@ -3812,18 +4391,27 @@ class ToolRegistry:
         """Executes automated benchmark evaluation suite to verify capability and catch regressions."""
         cat = str(category or "").strip()
         report = self.eval_suite.run_suite(category=cat)
-        lines = [
-            f"### EVAL BENCHMARK RESULTS (Category: '{cat or 'all'}')",
-            f"- **Pass Rate**: {report['pass_rate']}% ({report['passed']}/{report['total_cases']} cases passed)",
-            f"- **Average Quality Score**: {report['average_score']:.2f} / 1.0",
-            f"- **Average Duration**: {report['average_duration_sec']:.3f}s",
-            "\nCases Summary:",
-        ]
-        for r in report["results"]:
-            status_symbol = "✓ PASS" if r["passed"] else "✗ FAIL"
-            lines.append(f"  • `{r['case_id']}`: {status_symbol} (Score: {r['score']})")
-            if r.get("error"):
-                lines.append(f"    - Error: {r['error']}")
+        lines = [f"### EVAL RESULTS (Category: '{cat or 'all'}')"]
+        if report["attempted"] == 0:
+            lines.append("- **Status**: NOT RUN — no live evaluation runner is configured; this tool did not evaluate the agent.")
+            lines.append("- No pass rate or quality score is reported because no cases were executed.")
+        else:
+            lines.extend([
+                f"- **Status**: Executed {report['attempted']}/{report['total_cases']} cases",
+                f"- **Pass Rate**: {report['pass_rate']}% ({report['passed']}/{report['attempted']} attempted cases passed)",
+                f"- **Average Quality Score**: {report['average_score']:.2f} / 1.0",
+                f"- **Average Duration**: {report['average_duration_sec']:.3f}s",
+            ])
+        lines.append("\nCases Summary:")
+        for result in report["results"]:
+            if result["status"] == "not_run":
+                status_symbol = "NOT RUN"
+            else:
+                status_symbol = "PASS" if result["passed"] else "FAIL"
+            score = f" (Score: {result['score']})" if result["score"] is not None else ""
+            lines.append(f"  • `{result['case_id']}`: {status_symbol}{score}")
+            if result.get("error"):
+                lines.append(f"    - {result['error']}")
         return "\n".join(lines)
 
     def tool_self_improve_crystallize_lesson(
@@ -3863,60 +4451,99 @@ class ToolRegistry:
     async def tool_docker_sandbox_run(
         self,
         command: str,
-        image: str = "python:3.12-slim",
+        image: str = "titan-agent-sandbox:local",
         memory_limit: str = "512m",
         cpu_quota: str = "1.0",
         mount_workspace: bool = False,
-        network: str = "bridge",
+        network: str = "none",
         timeout: float = 60.0,
+        _mount_path: Path | str | None = None,
     ) -> str:
-        """Execute a shell command inside an isolated ephemeral Docker container."""
+        """Execute in a hardened ephemeral container; host workspace is opt-in.
+
+        ``_mount_path`` is an internal-only hook for trusted subsystems and is
+        intentionally absent from the model-visible tool schema.
+        """
         if not command or not str(command).strip():
             return "Error: command is required."
-        img = str(image or "python:3.12-slim").strip()
-        mem = str(memory_limit or "512m").strip()
-        cpus = str(cpu_quota or "1.0").strip()
-        net = str(network or "bridge").strip()
+        img = str(image or os.getenv("TITAN_COMMAND_SANDBOX_IMAGE", "titan-agent-sandbox:local")).strip()
+        mem = str(memory_limit or "512m").strip().lower()
+        try:
+            cpus_num = float(cpu_quota or 1.0)
+        except (TypeError, ValueError):
+            return "Error: cpu_quota must be a number between 0.1 and 4.0."
+        net = str(network or "none").strip().lower()
         t = max(1.0, min(float(timeout or 60.0), 300.0))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9./:_@-]{0,254}", img):
+            return "Error: invalid Docker image reference."
+        mem_match = re.fullmatch(r"([0-9]+)([kmg])", mem)
+        memory_bytes = 0
+        if mem_match:
+            memory_bytes = int(mem_match.group(1)) * {
+                "k": 1024, "m": 1024**2, "g": 1024**3,
+            }[mem_match.group(2)]
+        if not (64 * 1024**2 <= memory_bytes <= 4 * 1024**3) or not 0.1 <= cpus_num <= 4.0:
+            return "Error: memory_limit must be 64m..4g and cpu_quota must be 0.1..4.0."
+        if net not in {"none", "bridge"}:
+            return "Error: network must be 'none' or explicitly enabled 'bridge'."
 
         docker_bin = shutil.which("docker")
         if not docker_bin:
-            return "Error: docker executable not found on host. Ensure Docker Desktop or docker engine is installed and in PATH."
+            return "Error: Docker is required for isolated execution; no host fallback was attempted."
 
-        cmd = [
-            docker_bin,
-            "run",
-            "--rm",
-            f"--memory={mem}",
-            f"--cpus={cpus}",
-            f"--network={net}",
+        host_mount: Path | None = None
+        if _mount_path is not None:
+            host_mount = Path(_mount_path).resolve()
+            if not host_mount.is_dir():
+                return "Error: internal sandbox mount path must be an existing directory."
+        elif mount_workspace:
+            host_mount = self.workspace.resolve()
+        container_name = f"titan-sandbox-{uuid.uuid4().hex}"
+        docker_cmd = [
+            docker_bin, "run", "--name", container_name, "--rm", "--pull=never",
+            f"--memory={mem}", f"--cpus={cpus_num:.1f}", "--pids-limit=128",
+            f"--network={net}", "--read-only", "--cap-drop=ALL",
+            "--security-opt=no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
         ]
-        if mount_workspace:
-            cmd.extend(["-v", f"{self.workspace.resolve()}:/workspace", "-w", "/workspace"])
-
-        cmd.extend([img, "sh", "-c", command])
+        if host_mount is not None:
+            docker_cmd.extend(["--mount", f"type=bind,src={host_mount},dst=/workspace,rw"])
+        else:
+            docker_cmd.extend(["--tmpfs", "/workspace:rw,nosuid,nodev,size=64m"])
+        docker_cmd.extend(["--workdir", "/workspace"])
+        if hasattr(os, "getuid") and hasattr(os, "getgid"):
+            docker_cmd.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        docker_cmd.extend([img, "sh", "-lc", str(command)])
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *docker_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=t)
-            out_str = stdout.decode("utf-8", errors="ignore").strip()
-            err_str = stderr.decode("utf-8", errors="ignore").strip()
-            res = [f"### DOCKER SANDBOX [{img}] (Exit {proc.returncode})"]
+            stdout, stderr, timed_out, truncated = await _bounded_communicate(proc, t)
+            if timed_out:
+                await _best_effort_docker_rm(docker_bin, container_name)
+                return f"Error: Docker container execution timed out after {t:.0f}s."
+            if truncated:
+                await _best_effort_docker_rm(docker_bin, container_name)
+            out_str = stdout.decode("utf-8", errors="replace").strip()
+            err_str = stderr.decode("utf-8", errors="replace").strip()
+            exit_code = 125 if truncated and proc.returncode == 0 else proc.returncode
+            res = [f"### DOCKER SANDBOX [{img}] (Exit {exit_code})"]
             if out_str:
                 res.append(f"STDOUT:\n{out_str}")
             if err_str:
                 res.append(f"STDERR:\n{err_str}")
+            if truncated:
+                res.append(f"[Output truncated at {MAX_CAPTURE_BYTES_PER_STREAM} bytes per stream; process stopped]")
             if not out_str and not err_str:
                 res.append("(No output produced)")
             return "\n".join(res)
-        except asyncio.TimeoutError:
-            return f"Error: Docker container execution timed out after {t:.0f}s."
-        except Exception as e:  # noqa: BLE001
-            return f"Docker execution error: {e!s}"
+        except asyncio.CancelledError:
+            await _best_effort_docker_rm(docker_bin, container_name)
+            raise
+        except (OSError, RuntimeError) as exc:
+            return f"Docker execution error: {exc!s}"
 
     def tool_apply_patch(self, patch: str) -> str:
         """Applies a unified diff patch to files in the workspace."""
