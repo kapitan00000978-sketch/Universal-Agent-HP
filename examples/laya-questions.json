@@ -1,0 +1,20 @@
+{
+  "request_type": {
+    "type": "choice",
+    "instructions": "Classify the user's request.",
+    "criteria": {
+      "billing": "Invoices, payment, refund, duplicate charge",
+      "technical": "Bug, outage, setup, or software error",
+      "other": "Any other request"
+    }
+  },
+  "urgency": {
+    "type": "score",
+    "instructions": "How urgent is the request?",
+    "criteria": ["not urgent", "soon", "urgent"]
+  },
+  "needs_human": {
+    "type": "noul",
+    "instructions": "Does this request require a human to make a decision?"
+  }
+}

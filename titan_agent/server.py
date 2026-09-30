@@ -234,16 +234,30 @@ async def get_free_providers_endpoint():
 
 @app.get("/api/mcp/tools")
 async def get_mcp_tools():
-    servers_info = {}
+    # Include configured-but-offline servers as well as connected ones so an
+    # empty MCP result does not look like there is no MCP configuration.
+    configured = mcp_manager.load_config().get("mcpServers", {})
+    servers_info = {
+        name: {
+            "connected": False,
+            "status": "not_connected",
+            "tools_count": 0,
+            "tools": [],
+        }
+        for name in configured
+    }
     for s_name, conn in mcp_manager.servers.items():
         servers_info[s_name] = {
             "connected": conn.is_connected,
+            "status": "connected" if conn.is_connected else "disconnected",
             "tools_count": len(conn.tools),
-            "tools": [t.get("name") for t in conn.tools]
+            "tools": [t.get("name") for t in conn.tools],
         }
     return {
         "servers": servers_info,
-        "builtin_tools": [t["function"]["name"] for t in tool_registry.get_tool_definitions()]
+        "connected_count": sum(1 for server in servers_info.values() if server["connected"]),
+        "configured_count": len(servers_info),
+        "builtin_tools": [t["function"]["name"] for t in tool_registry.get_tool_definitions()],
     }
 
 @app.get("/api/workspace/files")
@@ -509,6 +523,45 @@ async def hitl_get(request_id: str):
     return {"request": req.to_dict()}
 
 
+class CheckpointReconcileBody(BaseModel):
+    operator: str = Field(..., min_length=1, max_length=120)
+    outcomes: dict[str, str] = Field(
+        ..., min_length=1,
+        description="Exact mapping of every pending tool_call_id to an operator-verified result.",
+    )
+
+
+@app.post("/api/checkpoints/{session_id}/reconcile")
+async def checkpoint_reconcile(session_id: str, body: CheckpointReconcileBody):
+    """Resume a classic interrupted batch only after explicit operator review.
+
+    This endpoint records supplied outcomes; it never retries the underlying
+    tool. Structured execution checkpoints cannot be reconciled this way.
+    """
+    store = agent.checkpoint_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="checkpoint storage is unavailable")
+    try:
+        cp = store.reconcile_tool_batch(
+            session_id,
+            body.outcomes,
+            operator=body.operator,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - never report a failed write as reconciled
+        raise HTTPException(status_code=503, detail="checkpoint reconciliation failed") from exc
+    return {
+        "status": "reconciled",
+        "session_id": cp.session_id,
+        "checkpoint_status": cp.status,
+        "reconciled_tool_call_ids": sorted(body.outcomes),
+        "next_step": "resume this session with resume=true; no tool call was replayed",
+    }
+
+
 @app.get("/api/staff/roles")
 async def staff_roles():
     """List of all available dedicated subagent specialist roles."""
@@ -567,6 +620,16 @@ async def tools_stats():
         "totals": summary["totals"],
         "tools": summary["tools"],
     }
+
+
+@app.get("/api/traces/recent")
+async def recent_run_traces(limit: int = 100, run_id: str = ""):
+    """Recent local run events; records exclude prompts, tool args, and outputs."""
+    store = agent.trace_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run trace store is unavailable.")
+    events = store.recent_events(limit, run_id=run_id or None)
+    return {"events": events, "count": len(events), "storage": "local_metadata_only"}
 
 
 # ---- Phase 29: repeated-failure guard observability API ----------------------

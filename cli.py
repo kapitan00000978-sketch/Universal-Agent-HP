@@ -410,7 +410,7 @@ async def resolve_cli_provider() -> tuple[str, str]:
 
 async def main():
     parser = argparse.ArgumentParser(description="Universal Agent HP CLI")
-    parser.add_argument("--provider", type=str, help="LLM Provider to use (e.g., openai, ollama, laya-mlx)")
+    parser.add_argument("--provider", type=str, help="Chat LLM provider (e.g., openai, ollama, lmstudio); Laya is available separately via laya_decide for typed decisions")
     parser.add_argument("--model", type=str, help="Model name to use")
     parser.add_argument("--mode", type=str, choices=VALID_MODES, default=os.getenv("TITAN_MODE", "fast").lower(), help="Reasoning mode")
     parser.add_argument("--effort", type=str, choices=VALID_EFFORTS, default=os.getenv("TITAN_EFFORT", "auto").lower(), help="Effort level")

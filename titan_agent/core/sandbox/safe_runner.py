@@ -1,8 +1,9 @@
-"""
-Phase 28 — Genesis Darajasi 8: Safe Script Runner & Subprocess Isolation.
+"""Legacy host-subprocess helper for trusted tests and internal utilities.
 
-Executes code inside isolated subprocesses with timeout enforcement,
-malicious pattern detection, and automatic rollback on failure.
+This module provides interpreter/process separation, timeouts, static pattern
+checks, and workspace rollback. It is NOT an OS/container security sandbox:
+code retains the host process user's privileges. Agent-facing code execution
+must use ToolRegistry's Docker-backed command path instead.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from .environment import SandboxEnvironment
 
 @dataclass
 class SandboxResult:
-    """Outcome of sandboxed execution."""
+    """Outcome of a process-isolated execution, not a host sandbox."""
 
     exit_code: int
     stdout: str
@@ -53,7 +54,7 @@ class SandboxResult:
 
 
 class SafeScriptRunner:
-    """Safely executes code with validation and optional rollback guards."""
+    """Runs code in a host subprocess; not an OS/container isolation boundary."""
 
     DANGEROUS_PATTERNS: ClassVar[list[re.Pattern[str]]] = [
         re.compile(r":\(\)\s*\{\s*:\|:&\s*\};:", re.IGNORECASE),  # bash fork bomb

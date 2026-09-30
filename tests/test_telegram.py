@@ -131,7 +131,17 @@ def test_agent_dispatch_telegram_send_refusal(tmp_path):
     ag.TelegramManager = lambda: m  # type: ignore[assignment]
     agent = None
     try:
-        agent = TitanAgent()
+        from types import SimpleNamespace
+        from titan_agent.core.guardrails.hitl import ApprovalStatus
+
+        class _ApprovedHITL:
+            def request(self, *_args, **_kwargs):
+                return SimpleNamespace(status=ApprovalStatus.APPROVED)
+
+            async def wait(self, request, timeout=None):
+                return request
+
+        agent = TitanAgent(hitl=_ApprovedHITL())
         res = asyncio.run(
             agent.execute_tool_unified("telegram_send", {"label": "w", "target": "stranger", "text": "hi"})
         )

@@ -147,15 +147,30 @@ class TestToolRegistrySandboxIntegration:
         assert (temp_workspace / "hello.py").read_text(encoding="utf-8") == "print('original')"
         assert not (temp_workspace / "test_tmp.txt").exists()
 
-    def test_tool_sandbox_execute_python(self, temp_workspace: Path):
+    def test_tool_sandbox_execute_python(self, temp_workspace: Path, monkeypatch):
+        import asyncio
+
         tools = ToolRegistry(temp_workspace)
-        exec_res = tools.tool_sandbox_execute("print(40 + 2)", language="python")
+        captured = {}
+
+        async def fake_sandbox_command(command, cwd="", _timeout_override=None):
+            captured["command"] = command
+            script = command.split(" ", 2)[-1]
+            captured["script"] = script
+            return "### DOCKER COMMAND SANDBOX (Exit 0)\\nSTDOUT:\\n42"
+
+        monkeypatch.setattr(tools, "tool_execute_command", fake_sandbox_command)
+        exec_res = asyncio.run(tools.tool_sandbox_execute("print(40 + 2)", language="python"))
         assert "SANDBOX EXECUTION RESULT" in exec_res
         assert "42" in exec_res
-        assert "**Success**: True" in exec_res
+        assert "PASSED" in exec_res
+        assert captured["command"].startswith("python -I /workspace/")
+        assert not list(temp_workspace.glob(".titan_python_exec_*.py"))
 
     def test_tool_sandbox_execute_empty(self, temp_workspace: Path):
+        import asyncio
+
         tools = ToolRegistry(temp_workspace)
-        assert "Error: code is required" in tools.tool_sandbox_execute("")
+        assert "Error: code is required" in asyncio.run(tools.tool_sandbox_execute(""))
         assert "Error: snapshot name is required" in tools.tool_sandbox_snapshot_create("")
         assert "Error: snapshot name is required" in tools.tool_sandbox_snapshot_rollback("")

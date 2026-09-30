@@ -454,18 +454,39 @@ class MCPManager:
         """Dynamically configures and hot-connects an MCP preset in one call."""
         from titan_agent.core.mcp.presets import MCPPresetManager
         mgr = MCPPresetManager(self.config_file)
-        cfg, err = mgr.generate_server_config(preset_id, env_overrides, custom_args)
-        if not cfg:
+        if env_overrides:
+            for key, value in env_overrides.items():
+                value = str(value).strip()
+                if not re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}", value):
+                    return False, (
+                        f"Refusing inline value for MCP environment field '{key}'. "
+                        "Store the value in the process environment and pass only a reference such as '{POSTGRES_URL}'."
+                    )
+                env_name = value[1:-1]
+                if not os.environ.get(env_name):
+                    return False, f"Required process environment variable '{env_name}' is not set."
+        runtime_cfg, err = mgr.generate_server_config(preset_id, env_overrides, custom_args)
+        if not runtime_cfg:
             return False, err
+        # Persist only the preset template. env_overrides may contain tokens,
+        # database URLs or other secrets, so they must never be written to the
+        # shared MCP JSON config. Runtime values are used only for this process.
+        persistent_cfg, persist_err = mgr.generate_server_config(preset_id)
+        if not persistent_cfg:
+            return False, persist_err
 
         name = server_name or preset_id
-        # Save to config file so it persists across runs
-        mgr.save_server_to_config(name, cfg)
+        persisted = mgr.save_server_to_config(name, persistent_cfg)
 
         ws = workspace_dir or (self.config_file.parent if self.config_file else Path.cwd())
-        cmd, args, env = self._resolve_server_command(cfg, ws)
+        cmd, args, env = self._resolve_server_command(runtime_cfg, ws)
         conn = MCPServerConnection(name, cmd, args, env)
         ok = await self._start_one(conn)
         if ok:
-            return True, f"Successfully connected MCP server '{name}' with {len(conn.tools)} tools."
+            message = f"Successfully connected MCP server '{name}' with {len(conn.tools)} tools."
+            if not persisted:
+                message += " Runtime connection is active, but its template could not be saved for restart."
+            else:
+                message += " Credentials were not saved; configure them in the process environment for future starts."
+            return True, message
         return False, f"Failed to start MCP server '{name}'. Check logs/dependencies."

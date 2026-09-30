@@ -36,6 +36,7 @@ htmlcov/
 *.sqlite3
 *.log
 workspace/
+benchmark-results/
 _staging/
 .titan/
 knowledge_graph.json

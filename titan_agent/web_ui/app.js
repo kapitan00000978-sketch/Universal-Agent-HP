@@ -102,7 +102,7 @@ async function fetchHITLPending(force) {
     const token = getApiKey();
     const headers = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
-    const res = await fetch("/api/hitl/pending", { headers });
+    const res = await apiFetch("/api/hitl/pending", { headers });
     if (!res.ok) {
       _hitlNextPoll = now + 60000;
       if (res.status === 401) promptForApiKey();
@@ -155,7 +155,7 @@ async function decideHITL(requestId, decision) {
     const token = getApiKey();
     const headers = { "Content-Type": "application/json" };
     if (token) headers["Authorization"] = `Bearer ${token}`;
-    const res = await fetch("/api/hitl/decide", {
+    const res = await apiFetch("/api/hitl/decide", {
       method: "POST",
       headers,
       body: JSON.stringify({ decision, request_id: requestId, by: "web-ui" }),
@@ -469,7 +469,7 @@ async function scanLocalModels() {
   const chipsContainer = document.getElementById("local-models-chips");
   chipsContainer.innerHTML = '<span style="font-size:11px; color:var(--accent-cyan);">Scanning...</span>';
   try {
-    const res = await fetch("/api/local-models");
+    const res = await apiFetch("/api/local-models");
     const data = await res.json();
     chipsContainer.innerHTML = "";
 
@@ -521,7 +521,7 @@ function sendQuickPrompt(text) {
 
 async function fetchConfig() {
   try {
-    const res = await fetch("/api/config");
+    const res = await apiFetch("/api/config");
     const data = await res.json();
     currentProviderSpan.textContent = data.provider.toUpperCase();
     currentModelSpan.textContent = displayModel(data.model);
@@ -541,7 +541,7 @@ async function saveConfig() {
     base_url: baseUrlInput.value.trim()
   };
   try {
-    const res = await fetch("/api/config", {
+    const res = await apiFetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
@@ -557,15 +557,17 @@ async function saveConfig() {
 
 async function fetchMcpTools() {
   try {
-    const res = await fetch("/api/mcp/tools");
+    const res = await apiFetch("/api/mcp/tools");
+    if (!res.ok) throw new Error(`MCP status request failed (${res.status})`);
     const data = await res.json();
     const servers = data.servers || {};
     const serverKeys = Object.keys(servers);
+    const connected = serverKeys.filter((key) => servers[key].connected).length;
+    const configured = data.configured_count ?? serverKeys.length;
     const mcpCountElem = document.getElementById("mcp-count");
     if (mcpCountElem) {
       const toolCount = serverKeys.reduce((sum, k) => sum + (servers[k].tools_count || 0), 0);
-      const plural = serverKeys.length === 1 ? "" : "s";
-      mcpCountElem.textContent = `${serverKeys.length} MCP server${plural} connected (${toolCount} tools)`;
+      mcpCountElem.textContent = `${connected}/${configured} MCP servers connected (${toolCount} tools)`;
     }
   } catch (e) {
     console.warn("MCP tools fetch failed", e);
@@ -574,7 +576,7 @@ async function fetchMcpTools() {
 
 async function fetchWorkspaceFiles() {
   try {
-    const res = await fetch("/api/workspace/files");
+    const res = await apiFetch("/api/workspace/files");
     const data = await res.json();
     const tree = document.getElementById("files-tree");
     if (!data.files || data.files.length === 0) {
@@ -693,7 +695,7 @@ async function handleLocalSlashCommand(text) {
     appendUserMessage(text);
     let cfgText = "Loading config...";
     try {
-      const res = await fetch("/api/config");
+      const res = await apiFetch("/api/config");
       const cfg = await res.json();
       cfgText = `<b>Provider:</b> ${cfg.provider} · <b>Model:</b> ${cfg.model}<br>` +
         `<b>Mode:</b> ${currentMode} · <b>Effort:</b> ${currentEffort} · <b>Workspace:</b> <code>${cfg.workspace}</code>`;
@@ -705,7 +707,7 @@ async function handleLocalSlashCommand(text) {
     appendUserMessage(text);
     let body = "No skills loaded.";
     try {
-      const res = await fetch("/api/tools/execute", {
+      const res = await apiFetch("/api/tools/execute", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tool_name: "skills_list", arguments: {} })
@@ -720,7 +722,7 @@ async function handleLocalSlashCommand(text) {
     appendUserMessage(text);
     let body = "No open handoffs.";
     try {
-      const res = await fetch("/api/memory/handoffs?status=open");
+      const res = await apiFetch("/api/memory/handoffs?status=open");
       const data = await res.json();
       const list = data.handoffs || [];
       if (list.length) {
@@ -735,7 +737,7 @@ async function handleLocalSlashCommand(text) {
     if (!arg) { appendRaw("Memory", "Usage: <code>/memory &lt;query&gt;</code>"); return true; }
     let body = "Nothing found.";
     try {
-      const res = await fetch("/api/memory?query=" + encodeURIComponent(arg));
+      const res = await apiFetch("/api/memory?query=" + encodeURIComponent(arg));
       const data = await res.json();
       const list = data.knowledge || [];
       if (list.length) {
@@ -788,11 +790,16 @@ async function sendMessage(prompt) {
   }
 
   try {
-    const response = await fetch("/api/chat/stream", {
+    const response = await apiFetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: prompt, session_id: "web_session", mode: currentMode, effort: currentEffort })
     });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`Chat request failed (${response.status})${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+    }
+    if (!response.body) throw new Error("Chat response did not include a stream.");
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
@@ -994,7 +1001,7 @@ async function sendPuterMessage(prompt, card, statusLine) {
       // Execute all tools simultaneously
       await Promise.all(jobs.map(async (job) => {
         try {
-          const execRes = await fetch("/api/tools/execute", {
+          const execRes = await apiFetch("/api/tools/execute", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ tool_name: job.tName, arguments: job.tArgs })
@@ -1103,6 +1110,9 @@ function handleAgentEvent(event, card, statusLine, state) {
       <div class="tool-result-box">${escapeHtml(resText.slice(0, 1000))}${resText.length > 1000 ? "\n...(truncated)" : ""}</div>
     `;
     card.insertBefore(resCard, statusLine);
+    if (event.data.name === "mcp_connect_preset") {
+      fetchMcpTools();
+    }
   }
   else if (event.type === "final_answer") {
     updatePipelineStep("step-final");

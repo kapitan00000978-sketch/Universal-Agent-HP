@@ -1,34 +1,29 @@
-import asyncio
-import json
-import logging
-import sys
+"""Compatibility adapter for the optional local Laya-MLX decision runtime."""
+from __future__ import annotations
 
-log = logging.getLogger(__name__)
+from typing import Any
+
+from .laya_decisions import predict_decisions
+
 
 class LayaMLXConnector:
-    """Connects Titan Agent to the local Laya MLX model."""
-    
-    def __init__(self, model_path: str = r"C:\Users\user\laya-mlx"):
+    """Expose genuine Laya-MLX typed inference; never fabricate chat responses."""
+
+    def __init__(self, model_path: str = "aac6fef/laya-mlx"):
         self.model_path = model_path
-        
-    async def generate_response(self, messages: list, **kwargs) -> str:
-        """
-        Calls the local Laya MLX model. Since MLX natively runs on Apple Silicon, 
-        this uses a robust fallback or subprocess call depending on the Windows environment.
-        """
-        # Format messages for the local model
-        prompt = ""
-        for m in messages:
-            prompt += f"<{m['role'].upper()}>\n{m['content']}\n</{m['role'].upper()}>\n"
-            
-        log.info(f"Sending prompt to Laya MLX local model at {self.model_path}")
-        
-        # Example subprocess call (mocked output for safety if MLX is missing on Windows)
-        try:
-            # Here you would normally run: python -m laya_mlx.cli --prompt "..."
-            # But we will simulate the execution to avoid MLX crashes on Windows.
-            await asyncio.sleep(1) # simulate inference time
-            
-            return "Bu Laya MLX lokal modelidan qaytgan javob. (Integration is successful!)"
-        except Exception as e:
-            raise RuntimeError(f"Laya MLX local inference error: {e}")
+
+    async def predict(self, state: str, questions: dict[str, Any]) -> str:
+        """Run a local typed-decision request without an API key."""
+        return await predict_decisions(
+            state,
+            questions,
+            backend="laya-mlx",
+            model=self.model_path,
+        )
+
+    async def generate_response(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        """Reject the old chat-shaped API: Laya does not generate free-form text."""
+        raise RuntimeError(
+            "Laya-MLX produces typed choice/score/yes-no decisions, not chat text. "
+            "Use predict(state, questions) or the laya_decide tool."
+        )

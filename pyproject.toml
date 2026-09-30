@@ -18,9 +18,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 
+[project.optional-dependencies]
+# Laya runtimes are optional because upstream Laya pulls a substantial PyTorch stack,
+# while Laya-MLX is supported only on Apple Silicon macOS.
+laya = ["laya>=0.3.22"]
+laya-mlx = ["laya-mlx>=0.2.0; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
 [project.scripts]
 universal = "titan_agent.entrypoint:universal_cli"
 universal-agent = "titan_agent.entrypoint:universal_cli"
+titan-laya-decide = "titan_agent.laya_decisions:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -52,10 +52,20 @@ def test_tool_edit_and_list():
     assert "test_edit.txt" in listing
 
 
-def test_tool_python_eval():
-    tools = ToolRegistry(WORKSPACE_DIR)
+def test_tool_python_eval_routes_through_sandbox(monkeypatch, tmp_path):
+    tools = ToolRegistry(tmp_path)
+    captured = {}
+
+    async def fake_sandbox_command(command, cwd="", _timeout_override=None):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        return "### DOCKER COMMAND SANDBOX (Exit 0)\\nSTDOUT:\\n42"
+
+    monkeypatch.setattr(tools, "tool_execute_command", fake_sandbox_command)
     py_res = asyncio.run(tools.tool_python_eval("print(40 + 2)"))
     assert "42" in py_res
+    assert "python -I -c" in captured["command"]
+    assert captured["cwd"] == "."
 
 
 def test_tool_workspace_rag(tmp_path):
@@ -265,13 +275,51 @@ def test_token_usage_endpoint_shape():
     assert data["calls"] >= 0
 
 
-def test_tool_deep_search():
+def test_tool_deep_search(monkeypatch):
+    from titan_agent.deep_search import DeepSearchEngine
+
+    async def fake_search(self, query, max_results=4):
+        return [{
+            "title": "Python 3.12 release notes",
+            "url": "https://example.test/python-312",
+            "snippet": "Stable test result; no external search required.",
+        }]
+
+    async def fake_scrape(self, url):
+        return "Deterministic scraped content for the test."
+
+    monkeypatch.setattr(DeepSearchEngine, "_search_query", fake_search)
+    monkeypatch.setattr(DeepSearchEngine, "_scrape_url", fake_scrape)
+
     tools = ToolRegistry(WORKSPACE_DIR)
     deep_s_res = asyncio.run(tools.tool_deep_search("Python 3.12"))
     assert "DEEP RESEARCH DOSSIER" in deep_s_res
+    assert "Python 3.12 release notes" in deep_s_res
+    assert "Deterministic scraped content" in deep_s_res
 
 
-def test_tool_deep_coder():
+def test_deep_search_provider_error_returns_empty_results(monkeypatch):
+    from titan_agent import deep_search
+
+    class BrokenSearchProvider:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def text(self, *_args, **_kwargs):
+            raise ValueError("provider-specific network error")
+
+    monkeypatch.setattr(deep_search, "DDGS", BrokenSearchProvider)
+    results = asyncio.run(deep_search.DeepSearchEngine()._search_query("Python 3.12"))
+
+    assert results == []
+
+
+def test_tool_deep_coder(monkeypatch):
+    # Trusted fixed fixture: this test explicitly opts into host execution.
+    monkeypatch.setenv("TITAN_FULL_ACCESS", "1")
     tools = ToolRegistry(WORKSPACE_DIR)
     deep_c_res = asyncio.run(tools.tool_deep_coder(
         "sample_math",
@@ -346,7 +394,7 @@ def test_agent_tool_definitions_include_new_tools():
     from titan_agent.agent import TitanAgent
     agent = TitanAgent()
     names = [t["function"]["name"] for t in agent._build_tools_list()]
-    for expected in ("system_info", "manage_processes", "memory_save", "memory_search"):
+    for expected in ("system_info", "manage_processes", "memory_save", "memory_search", "analyze_python_file", "analyze_python_repository"):
         assert expected in names
 
 

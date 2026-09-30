@@ -76,7 +76,7 @@ _PROVIDER_API_KEY_ATTR = {
     "cohere": "COHERE_API_KEY",
 }
 # Local / browser / free providers never need a key.
-_LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio", "puter", "g4f", "tgpt", "laya-mlx", "extra-llm-x", "extra_llm_x", "elx"})
+_LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio", "puter", "g4f", "tgpt", "laya", "laya-mlx", "extra-llm-x", "extra_llm_x", "elx"})
 
 
 class LLMResponse:
@@ -141,8 +141,8 @@ class LLMClient:
             # Python-tGPT library (no key required)
             self.base_url = ""
             self.api_key = ""
-        elif self.provider == "laya-mlx":
-            # Local Laya MLX model
+        elif self.provider in {"laya", "laya-mlx"}:
+            # Laya is a local typed-decision model, not a chat-completion model.
             self.base_url = ""
             self.api_key = ""
         elif self.provider == "completions":
@@ -389,16 +389,14 @@ class LLMClient:
             except Exception as e:
                 raise RuntimeError(f"G4F API Error: {e}")
 
-        # --- Laya MLX Local Integration ---
-        if self.provider == "laya-mlx":
-            from titan_agent.laya_mlx_server import LayaMLXConnector
-            try:
-                connector = LayaMLXConnector()
-                response_text = await connector.generate_response(messages=messages)
-                cleaned_content, thoughts, parsed_tools = self._extract_thoughts_and_tools(response_text)
-                return LLMResponse(content=cleaned_content, tool_calls=parsed_tools, thoughts=thoughts)
-            except Exception as e:
-                raise RuntimeError(f"Laya MLX API Error: {e}")
+        # Laya models return typed choices/scores/probabilities; they cannot
+        # implement this autoregressive chat-completion API or generate code.
+        if self.provider in {"laya", "laya-mlx"}:
+            raise RuntimeError(
+                "Laya is a local typed-decision engine, not a chat/text-generation provider. "
+                "Use the laya_decide tool for choice/score/yes-no inference, or configure a "
+                "chat model (API provider, Ollama, or LM Studio) for conversation and coding."
+            )
 
         # --- Python-tGPT Integration ---
         if self.provider == "tgpt":

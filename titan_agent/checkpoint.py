@@ -6,18 +6,24 @@ Devin's long-horizon sessions and Claude Code's ``--continue`` rely on.
 
 Design rules:
 
-- **Always-on by default**: the agent persists a checkpoint at run start, after
-  every tool step, and on completion/error — an interruption never loses the
-  session's work.
-- **SQLite-backed and file-lock safe**: every connection is context-managed and
-  closed, so the DB file is deletable even on Windows.
-- **Resume** restores the last N messages and continues the classic loop from
-  exactly where it stopped; a ``status == \"done\"`` session returns its saved
-  final answer instead of re-running.
+- **SQLite-backed**: checkpoint rows save run state between completed steps.
+- **Pre-action barrier**: classic tool batches and structured runs are marked
+  in progress durably before tools may cause side effects. If recovery finds an
+  ambiguous in-progress action, it stops rather than replaying it. For classic
+  tool batches, an operator can verify each external result and atomically
+  reconcile every pending tool-call ID before resuming. Structured runs remain
+  paused and require a fresh run; this is not exactly-once execution.
+- **Resume** restores message structure and step metadata for ordinary
+  interrupted runs. A ``status == \"done\"`` session returns its saved final
+  answer instead of re-running.
+- **Sensitive state**: checkpoint messages can include user text, model output,
+  and tool arguments/results. Protect the local SQLite file accordingly; unlike
+  the separate run trace journal, checkpoint contents are not metadata-only.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -57,6 +63,12 @@ class CheckpointStore:
     def __init__(self, db_path: Path | str | None = None):
         self.db_path = Path(db_path) if db_path else Path.cwd() / "titan_checkpoints.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Checkpoints contain prompts and tool payloads. Create/restrict the DB
+        # to the owner on POSIX rather than inheriting a permissive umask.
+        fd = os.open(self.db_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        if os.name != "nt":
+            os.chmod(self.db_path, 0o600)
         self._init_db()
 
     @contextmanager
@@ -151,6 +163,106 @@ class CheckpointStore:
         with self._conn() as conn:
             cur = conn.execute("DELETE FROM checkpoints WHERE session_id = ?", (session_id,))
         return cur.rowcount > 0
+
+    def reconcile_tool_batch(
+        self,
+        session_id: str,
+        outcomes: dict[str, str],
+        *,
+        operator: str,
+    ) -> RunCheckpoint:
+        """Record operator-verified results for an interrupted classic tool batch.
+
+        This does not retry tools. The operator must provide exactly one
+        non-empty outcome for every still-pending tool_call_id. Reconciliation
+        is atomic and only applies to ``tool_in_progress`` checkpoints;
+        structured runs remain paused because their internal engine state is
+        not represented as resumable tool-call messages.
+        """
+        who = str(operator or "").strip()[:120]
+        if not who:
+            raise ValueError("operator identity is required")
+        if not isinstance(outcomes, dict) or not outcomes:
+            raise ValueError("at least one operator-verified outcome is required")
+        normalized = {
+            str(call_id): str(result).strip()
+            for call_id, result in outcomes.items()
+        }
+        if any(not result for result in normalized.values()):
+            raise ValueError("every reconciled tool call needs a non-empty outcome")
+        if any(len(result) > 4000 for result in normalized.values()):
+            raise ValueError("reconciled tool outcomes must be at most 4000 characters")
+
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"checkpoint '{session_id}' was not found")
+            cp = self._row_to_cp(row)
+            if cp.status != "tool_in_progress":
+                raise ValueError(
+                    "manual tool reconciliation is available only for classic "
+                    "tool_in_progress checkpoints"
+                )
+
+            calls: dict[str, str] = {}
+            completed_ids = {
+                str(message.get("tool_call_id"))
+                for message in cp.messages
+                if message.get("role") == "tool" and message.get("tool_call_id")
+            }
+            for message in cp.messages:
+                if message.get("role") != "assistant":
+                    continue
+                for call in message.get("tool_calls") or []:
+                    call_id = str(call.get("id") or "").strip()
+                    function = call.get("function") or {}
+                    if call_id and call_id not in completed_ids:
+                        if call_id in calls:
+                            raise ValueError(f"duplicate pending tool_call_id in checkpoint: {call_id}")
+                        calls[call_id] = str(function.get("name") or "unknown_tool")
+            pending_ids = set(calls)
+            supplied_ids = set(normalized)
+            if not pending_ids:
+                raise ValueError("checkpoint contains no pending classic tool calls")
+            if supplied_ids != pending_ids:
+                missing = sorted(pending_ids - supplied_ids)
+                extra = sorted(supplied_ids - pending_ids)
+                raise ValueError(
+                    f"outcomes must match pending tool_call_ids exactly; missing={missing}, extra={extra}"
+                )
+
+            for call_id, tool_name in calls.items():
+                cp.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": tool_name,
+                    "content": (
+                        f"[Operator-reported reconciliation by {who}; this tool was NOT replayed. "
+                        f"Verify source evidence before relying on this result.]\n{normalized[call_id]}"
+                    ),
+                })
+            cp.status = "running"
+            cp.final_answer = None
+            cp.updated_at = _now()
+            updated = conn.execute(
+                """
+                UPDATE checkpoints
+                SET messages = ?, status = ?, final_answer = NULL, updated_at = ?
+                WHERE session_id = ? AND status = 'tool_in_progress'
+                """,
+                (
+                    json.dumps(cp.messages, ensure_ascii=False),
+                    cp.status,
+                    cp.updated_at,
+                    session_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("checkpoint changed during reconciliation")
+        return cp
 
     def stats(self) -> dict[str, int]:
         with self._conn() as conn:
