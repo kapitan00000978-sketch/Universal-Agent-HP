@@ -96,6 +96,7 @@ class LLMClient:
     def __init__(self, provider: str | None = None, model: str | None = None):
         self.provider = provider or DEFAULT_PROVIDER
         self.model = model or DEFAULT_MODEL
+        self.fallback_models = []  # List of models to try if the primary fails (for dynamic model discovery)
         self._setup_credentials()
         # Global token throughput guardrail (214,000 tokens/s cap).
         self.token_limiter = TokenRateLimiter()
@@ -274,6 +275,12 @@ class LLMClient:
         a doomed HTTP round-trip is pointless when the sibling may already work.
         """
         chain: list[tuple[str, str]] = [(self.provider, self.model)]
+        
+        # Add dynamic fallback models for the SAME provider
+        for fm in self.fallback_models:
+            if (self.provider, fm) not in chain:
+                chain.append((self.provider, fm))
+
         seen = {self.provider}
         overrides = provider_fallback_models()
         for provider in provider_fallback_chain():

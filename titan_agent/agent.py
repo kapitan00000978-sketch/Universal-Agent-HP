@@ -2395,6 +2395,31 @@ class TitanAgent:
             )
             return
 
+        # ---- Auto API Key Discovery & Model Fallback setup ----
+        import re
+        api_key_match = re.match(r"^(sk-[a-zA-Z0-9_-]{20,}|gsk_[a-zA-Z0-9_-]+|AIza[a-zA-Z0-9_-]+)$", user_input.strip())
+        if api_key_match:
+            yield AgentEvent("status", "API key detected! Scanning available models...")
+            from titan_agent.key_discovery import discover_api_key
+            import os
+            key = api_key_match.group(1)
+            provider, base_url, models = await discover_api_key(key)
+            if provider and models:
+                yield AgentEvent("status", f"Successfully connected to {provider}. Found {len(models)} models.")
+                # Save first model as primary, others as fallback
+                self.llm.set_model(provider, models[0], key, base_url)
+                
+                # Setup fallback chain globally dynamically
+                self.llm.fallback_models = models[1:]
+                
+                yield AgentEvent("final_answer", f"API Key activated for `{provider}`.\nPrimary Model: `{models[0]}`.\nFallbacks saved: `{len(models)-1}` models (seamless switch on rate limit).")
+                return
+            else:
+                yield AgentEvent("error", "Could not discover any models with the provided API key.")
+                yield AgentEvent("final_answer", "API Key was invalid or no models available.")
+                return
+
+
         # Dual-Shield Cyber Defense Evaluation (Blue Team continuous + Emergency Red Team)
         from titan_agent.core.security.dual_shield import DualShieldOrchestrator
         shield = DualShieldOrchestrator.get_instance()
