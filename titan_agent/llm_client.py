@@ -338,27 +338,30 @@ class LLMClient:
         chain = self._build_fallback_chain()
         original = (self.provider, self.model, self.base_url, self.api_key)
         errors: list[str] = []
-        try:
-            for provider, model in chain:
-                if provider != self.provider or model != self.model:
-                    self.set_model(provider, model)
-                try:
-                    return await self._chat_completion_once(
-                        messages, tools=tools, temperature=temperature, max_tokens=max_tokens
-                    )
-                except (aiohttp.ClientError, OSError, asyncio.TimeoutError, RuntimeError) as exc:
-                    if isinstance(exc, RuntimeError) and not self._is_transient_api_error(exc):
-                        raise  # auth / malformed request — not eligible for fallback
-                    errors.append(f"{provider} ({model}): {exc}")
-                    log.warning("LLM provider '%s' (%s) failed, trying next: %s", provider, model, exc)
-                    continue
-            detail = " | ".join(errors) if errors else "all providers exhausted"
-            raise RuntimeError(f"All providers failed. Errors: {detail}")
-        finally:
-            # Restore the configured provider/model/credentials so a fallback
-            # mid-flight does not permanently swap the client's configuration.
-            self.provider, self.model = original[0], original[1]
-            self.base_url, self.api_key = original[2], original[3]
+        for provider, model in chain:
+            if provider != self.provider or model != self.model:
+                self.set_model(provider, model)
+            try:
+                response = await self._chat_completion_once(
+                    messages, tools=tools, temperature=temperature, max_tokens=max_tokens
+                )
+                # Success: keep the fallback as primary
+                return response
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError, RuntimeError) as exc:
+                if isinstance(exc, RuntimeError) and not self._is_transient_api_error(exc):
+                    # Restore original on fatal error
+                    self.provider, self.model = original[0], original[1]
+                    self.base_url, self.api_key = original[2], original[3]
+                    raise  # auth / malformed request — not eligible for fallback
+                errors.append(f"{provider} ({model}): {exc}")
+                log.warning("LLM provider '%s' (%s) failed, trying next: %s", provider, model, exc)
+                continue
+        
+        # If all fail, restore original and raise
+        self.provider, self.model = original[0], original[1]
+        self.base_url, self.api_key = original[2], original[3]
+        detail = " | ".join(errors) if errors else "all providers exhausted"
+        raise RuntimeError(f"All providers failed. Errors: {detail}")
 
     async def _chat_completion_once(
         self,

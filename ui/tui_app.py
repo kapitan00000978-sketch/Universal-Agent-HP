@@ -305,7 +305,7 @@ class UniversalAgentTUI(App):
             with Horizontal(id="sub-bar"):
                 yield Label("Build ", classes="badge-mode")
                 yield Label("· ", classes="separator")
-                yield Label("OmniRoute / Universal-R1 ", classes="badge-model")
+                yield Label("OmniRoute / Universal-R1 ", classes="badge-model", id="active-model")
                 yield Label("Universal Zen", classes="sub-text")
 
             # Qisqa klaviatura buyruqlari
@@ -319,6 +319,18 @@ class UniversalAgentTUI(App):
         self.output_log.write("[dim]Type your command above or press [bold cyan]ctrl+p[/bold cyan] for actions, [bold cyan]shift+tab[/bold cyan] for agents.[/dim]")
         input_box = self.query_one("#input-box", Input)
         input_box.focus()
+        self.set_interval(1.0, self.update_model_badge)
+
+    def update_model_badge(self) -> None:
+        if self._agent and hasattr(self._agent, "llm"):
+            try:
+                badge = self.query_one("#active-model", Label)
+                current_text = f"{self._agent.llm.provider} / {self._agent.llm.model} "
+                if badge.renderable != current_text and "OmniRoute" not in str(badge.renderable):
+                    self.output_log.write(f"[dim yellow]🔄 Model fallback initiated. Seamlessly switched to {current_text.strip()}[/dim yellow]")
+                badge.update(current_text)
+            except Exception:
+                pass
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         user_text = event.value.strip()
